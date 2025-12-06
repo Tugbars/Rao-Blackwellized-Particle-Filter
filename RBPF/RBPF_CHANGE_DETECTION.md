@@ -20,7 +20,7 @@ P(changepoint at t) = λ    ← same probability every tick
 
 Markets don't work this way:
 - Volatility clusters (calm periods last, crises cluster)
-- Regime duration is state-dependent
+- Regime duration is state-dependentssas
 - Changes aren't memoryless
 
 BOCPD asks: "Did something change?"  
