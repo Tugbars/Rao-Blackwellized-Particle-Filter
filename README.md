@@ -19,6 +19,12 @@ A production-grade particle filter implementation using the Kim-Shephard-Chib (1
 | **Latency** | <25μs | **~20μs** ✅ |
 | **Particles Required** | - | **200** (vs 2000+ standard PF) |
 
+---
+
+## Architecture
+
+```
+
 ```
 
 ### Why Rao-Blackwellization?
