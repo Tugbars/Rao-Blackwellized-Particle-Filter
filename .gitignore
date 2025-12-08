@@ -12,3 +12,14 @@ RBPF/RBPF_CHANGE_DETECTION.md
 RBPF/RBPF_KSC_DOCUMENTATION (1).md
 rbpf_ssa_integration/ssa_rbpf_bridge.c
 rbpf_ssa_integration/ssa_rbpf_bridge.h
+test/rbpf_change_detection.png
+test/rbpf_flash_crash_zoom.png
+test/rbpf_latency.png
+test/rbpf_position_scaling.png
+test/rbpf_regime_confidence.png
+test/rbpf_regime_detection.png
+test/rbpf_standard.csv
+test/rbpf_summary.csv
+test/rbpf_volatility_tracking.png
+test/rbpf_apf.csv
+test/.ipynb_checkpoints/rbpf_analysis-checkpoint.ipynb
