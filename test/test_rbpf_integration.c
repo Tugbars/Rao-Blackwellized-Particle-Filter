@@ -44,9 +44,36 @@
 #include "rbpf_ksc_param_integration.h"
 
 /*═══════════════════════════════════════════════════════════════════════════
- * TIMING
+ * PLATFORM-SPECIFIC TIMING
  *═══════════════════════════════════════════════════════════════════════════*/
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+typedef struct
+{
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+} Timer;
+
+static LARGE_INTEGER timer_freq = {0};
+
+static void timer_start(Timer *t)
+{
+    if (timer_freq.QuadPart == 0)
+    {
+        QueryPerformanceFrequency(&timer_freq);
+    }
+    QueryPerformanceCounter(&t->start);
+}
+
+static double timer_stop_us(Timer *t)
+{
+    QueryPerformanceCounter(&t->end);
+    return (double)(t->end.QuadPart - t->start.QuadPart) * 1e6 / (double)timer_freq.QuadPart;
+}
+#else
 typedef struct
 {
     struct timespec start;
@@ -65,6 +92,7 @@ static double timer_stop_us(Timer *t)
     double nsec = (t->end.tv_nsec - t->start.tv_nsec);
     return (sec * 1e6) + (nsec / 1000.0);
 }
+#endif
 
 /*═══════════════════════════════════════════════════════════════════════════
  * TEST HELPERS
@@ -192,7 +220,7 @@ static void test_regime_params_sync(void)
     ASSERT_NEAR(ext->rbpf->params[2].theta, 0.10f, 0.01f, "RBPF R2 theta set");
 
     /* Check Storvik received params */
-    ASSERT_NEAR(ext->storvik.priors[0].mu0, -4.6f, 0.01f, "Storvik R0 mu0 set");
+    ASSERT_NEAR(ext->storvik.priors[0].m, -4.6f, 0.01f, "Storvik R0 m (mu prior) set");
     ASSERT_NEAR(ext->storvik.priors[2].phi, 0.10f, 0.01f, "Storvik R2 phi set");
 
     rbpf_ext_destroy(ext);
