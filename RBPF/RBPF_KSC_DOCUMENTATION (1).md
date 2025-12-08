@@ -62,7 +62,7 @@ Develop a high-frequency trading (HFT) volatility filter that:
 The underlying model is an Ornstein-Uhlenbeck process for log-volatility:
 
 ```
-State equation:  ss   ℓ_t = (1-θ)ℓ_{t-1} + θμ + η_t,    η_t ~ N(0, σ²_vol)
+State equation:     ℓ_t = (1-θ)ℓ_{t-1} + θμ + η_t,    η_t ~ N(0, σ²_vol)
 Observation:        y_t = exp(ℓ_t/2) × ε_t,           ε_t ~ N(0, 1)
 ```
 
