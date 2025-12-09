@@ -83,6 +83,24 @@ extern "C"
         int ssa_connected;
         int structural_break_signaled;
 
+        /*═══════════════════════════════════════════════════════════════════════
+         * TRANSITION MATRIX LEARNING (Optional)
+         *
+         * Learns P_ij (probability of regime i → j) from particle transitions.
+         * Uses Dirichlet-Multinomial sufficient statistics with forgetting.
+         *
+         * Benefits:
+         *   - "Choppy" markets: learns looser diagonal → faster switching
+         *   - "Crisis Persist": learns sticky R3 → doesn't jump back prematurely
+         *═══════════════════════════════════════════════════════════════════════*/
+        int trans_learn_enabled;                                 /* 0=fixed, 1=adaptive */
+        double trans_counts[RBPF_MAX_REGIMES][RBPF_MAX_REGIMES]; /* Sufficient stats N_ij */
+        double trans_forgetting;                                 /* Decay factor (0.995 default) */
+        double trans_prior_diag;                                 /* Prior strength for diagonal (50.0) */
+        double trans_prior_off;                                  /* Prior strength for off-diag (1.0) */
+        int trans_update_interval;                               /* Rebuild LUT every N ticks (100) */
+        int trans_ticks_since_update;                            /* Counter */
+
     } RBPF_Extended;
 
     /*─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +164,53 @@ extern "C"
      * Signal structural break from SSA/BOCPD (triggers immediate sampling)
      */
     void rbpf_ext_signal_structural_break(RBPF_Extended *ext);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * TRANSITION MATRIX LEARNING (Optional)
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /**
+     * Enable/disable online transition matrix learning
+     *
+     * When enabled, the filter learns P_ij from observed particle transitions.
+     * This helps in:
+     *   - Choppy markets: learns to switch regimes more eagerly
+     *   - Crisis persistence: learns that crisis is sticky
+     *
+     * @param ext     Extended RBPF handle
+     * @param enable  1 to enable, 0 to disable
+     */
+    void rbpf_ext_enable_transition_learning(RBPF_Extended *ext, int enable);
+
+    /**
+     * Configure transition learning parameters
+     *
+     * @param ext              Extended RBPF handle
+     * @param forgetting       Decay factor per tick (0.995 = slow adaptation)
+     * @param prior_diag       Prior strength for diagonal (50.0 = sticky)
+     * @param prior_off        Prior strength for off-diagonal (1.0)
+     * @param update_interval  Ticks between LUT rebuilds (100)
+     */
+    void rbpf_ext_configure_transition_learning(RBPF_Extended *ext,
+                                                double forgetting,
+                                                double prior_diag,
+                                                double prior_off,
+                                                int update_interval);
+
+    /**
+     * Reset transition counts to zero (keeps priors)
+     */
+    void rbpf_ext_reset_transition_counts(RBPF_Extended *ext);
+
+    /**
+     * Get current learned transition probability
+     *
+     * @param ext   Extended RBPF handle
+     * @param from  Source regime
+     * @param to    Destination regime
+     * @return Learned P(from → to)
+     */
+    double rbpf_ext_get_transition_prob(const RBPF_Extended *ext, int from, int to);
 
     /*─────────────────────────────────────────────────────────────────────────────
      * MAIN UPDATE - THE HOT PATH

@@ -405,14 +405,17 @@ typedef struct
 
 typedef enum
 {
-    MODE_BASELINE = 0, /* RBPF alone, no learning */
-    MODE_LIU_WEST,     /* RBPF + Liu-West */
-    MODE_STORVIK,      /* RBPF + Storvik */
-    MODE_STORVIK_APF   /* RBPF + Storvik + APF */
+    MODE_BASELINE = 0,     /* RBPF alone, true params */
+    MODE_BASELINE_MISSPEC, /* RBPF alone, wrong params (realistic) */
+    MODE_LIU_WEST,         /* RBPF + Liu-West */
+    MODE_STORVIK,          /* RBPF + Storvik */
+    MODE_STORVIK_APF,      /* RBPF + Storvik + APF */
+    NUM_MODES
 } TestMode;
 
 static const char *mode_names[] = {
     "Baseline",
+    "Misspec",
     "Liu-West",
     "Storvik",
     "Storvik+APF"};
@@ -448,6 +451,26 @@ static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
         }
         rbpf_ksc_build_transition_lut(rbpf_raw, trans);
         rbpf_ksc_init(rbpf_raw, TRUE_MU_VOL[0], 0.1f);
+        break;
+
+    case MODE_BASELINE_MISSPEC:
+        /* Realistic scenario: parameters are 20-30% wrong
+         * This demonstrates why online learning matters.
+         *
+         * Errors:
+         *   mu_vol:    20% too high (less volatile than reality)
+         *   sigma_vol: 30% too low (underestimate noise)
+         *   theta:     same (hardest to estimate anyway)
+         */
+        rbpf_raw = rbpf_ksc_create(N_PARTICLES, N_REGIMES);
+        for (int r = 0; r < N_REGIMES; r++)
+        {
+            rbpf_real_t wrong_mu = TRUE_MU_VOL[r] * 0.8f;       /* 20% too high (closer to 0) */
+            rbpf_real_t wrong_sigma = TRUE_SIGMA_VOL[r] * 0.7f; /* 30% too low */
+            rbpf_ksc_set_regime_params(rbpf_raw, r, TRUE_THETA[r], wrong_mu, wrong_sigma);
+        }
+        rbpf_ksc_build_transition_lut(rbpf_raw, trans);
+        rbpf_ksc_init(rbpf_raw, TRUE_MU_VOL[0] * 0.8f, 0.1f);
         break;
 
     case MODE_LIU_WEST:
@@ -489,6 +512,7 @@ static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
         switch (mode)
         {
         case MODE_BASELINE:
+        case MODE_BASELINE_MISSPEC:
         case MODE_LIU_WEST:
             rbpf_ksc_step(rbpf_raw, ret, &output);
             break;
@@ -506,6 +530,9 @@ static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
             {
                 rbpf_ext_step(ext, ret, &output);
             }
+            break;
+
+        default:
             break;
         }
 
@@ -749,7 +776,7 @@ static void write_summary_csv(const char *filename, SummaryMetrics *metrics, int
 int main(int argc, char **argv)
 {
     int seed = 42;
-    const char *output_dir = ".";
+    const char *output_dir = "../../test/csv"; /* Default: root/test/csv from Build/Release */
 
     if (argc > 1)
         seed = atoi(argv[1]);
@@ -771,18 +798,19 @@ int main(int argc, char **argv)
     printf("  Scenarios: %d\n\n", data->n_scenarios);
 
     int n = data->n_ticks;
-    TickRecord *records[4];
-    SummaryMetrics metrics[4];
-    double total_time[4], max_latency[4];
+    TickRecord *records[NUM_MODES];
+    SummaryMetrics metrics[NUM_MODES];
+    double total_time[NUM_MODES], max_latency[NUM_MODES];
 
     const char *csv_names[] = {
         "rbpf_baseline.csv",
+        "rbpf_misspec.csv",
         "rbpf_liu_west.csv",
         "rbpf_storvik.csv",
         "rbpf_storvik_apf.csv"};
 
-    /* Run all 4 modes */
-    for (int mode = 0; mode < 4; mode++)
+    /* Run all modes */
+    for (int mode = 0; mode < NUM_MODES; mode++)
     {
         printf("Running %s...\n", mode_names[mode]);
         records[mode] = (TickRecord *)calloc(n, sizeof(TickRecord));
@@ -799,7 +827,7 @@ int main(int argc, char **argv)
     /* Write CSVs */
     printf("Writing CSV files to: %s\n", output_dir);
 
-    for (int mode = 0; mode < 4; mode++)
+    for (int mode = 0; mode < NUM_MODES; mode++)
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", output_dir, csv_names[mode]);
@@ -808,43 +836,43 @@ int main(int argc, char **argv)
 
     char summary_path[512];
     snprintf(summary_path, sizeof(summary_path), "%s/rbpf_comparison_summary.csv", output_dir);
-    write_summary_csv(summary_path, metrics, 4);
+    write_summary_csv(summary_path, metrics, NUM_MODES);
 
     /* Print comparison table */
-    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("\n════════════════════════════════════════════════════════════════════════════\n");
     printf("  SUMMARY COMPARISON\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("%-20s %12s %12s %12s %12s\n", "Metric", "Baseline", "Liu-West", "Storvik", "Storvik+APF");
-    printf("───────────────────────────────────────────────────────────────\n");
-    printf("%-20s %12.4f %12.4f %12.4f %12.4f\n", "Log-Vol RMSE",
+    printf("════════════════════════════════════════════════════════════════════════════\n");
+    printf("%-20s %10s %10s %10s %10s %12s\n", "Metric", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+APF");
+    printf("────────────────────────────────────────────────────────────────────────────\n");
+    printf("%-20s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "Log-Vol RMSE",
            metrics[0].log_vol_rmse, metrics[1].log_vol_rmse,
-           metrics[2].log_vol_rmse, metrics[3].log_vol_rmse);
-    printf("%-20s %12.4f %12.4f %12.4f %12.4f\n", "Vol RMSE",
+           metrics[2].log_vol_rmse, metrics[3].log_vol_rmse, metrics[4].log_vol_rmse);
+    printf("%-20s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "Vol RMSE",
            metrics[0].vol_rmse, metrics[1].vol_rmse,
-           metrics[2].vol_rmse, metrics[3].vol_rmse);
-    printf("%-20s %11.1f%% %11.1f%% %11.1f%% %11.1f%%\n", "Regime Accuracy",
+           metrics[2].vol_rmse, metrics[3].vol_rmse, metrics[4].vol_rmse);
+    printf("%-20s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%%\n", "Regime Accuracy",
            100 * metrics[0].regime_accuracy, 100 * metrics[1].regime_accuracy,
-           100 * metrics[2].regime_accuracy, 100 * metrics[3].regime_accuracy);
-    printf("%-20s %12.2f %12.2f %12.2f %12.2f\n", "Avg Latency (us)",
+           100 * metrics[2].regime_accuracy, 100 * metrics[3].regime_accuracy, 100 * metrics[4].regime_accuracy);
+    printf("%-20s %10.2f %10.2f %10.2f %10.2f %12.2f\n", "Avg Latency (us)",
            metrics[0].avg_latency_us, metrics[1].avg_latency_us,
-           metrics[2].avg_latency_us, metrics[3].avg_latency_us);
-    printf("%-20s %12.2f %12.2f %12.2f %12.2f\n", "P99 Latency (us)",
+           metrics[2].avg_latency_us, metrics[3].avg_latency_us, metrics[4].avg_latency_us);
+    printf("%-20s %10.2f %10.2f %10.2f %10.2f %12.2f\n", "P99 Latency (us)",
            metrics[0].p99_latency_us, metrics[1].p99_latency_us,
-           metrics[2].p99_latency_us, metrics[3].p99_latency_us);
-    printf("%-20s %12.1f %12.1f %12.1f %12.1f\n", "Avg ESS",
+           metrics[2].p99_latency_us, metrics[3].p99_latency_us, metrics[4].p99_latency_us);
+    printf("%-20s %10.1f %10.1f %10.1f %10.1f %12.1f\n", "Avg ESS",
            metrics[0].avg_ess, metrics[1].avg_ess,
-           metrics[2].avg_ess, metrics[3].avg_ess);
-    printf("%-20s %12.4f %12.4f %12.4f %12.4f\n", "mu_vol R0 Error",
+           metrics[2].avg_ess, metrics[3].avg_ess, metrics[4].avg_ess);
+    printf("%-20s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "mu_vol R0 Error",
            metrics[0].mu_vol_r0_error, metrics[1].mu_vol_r0_error,
-           metrics[2].mu_vol_r0_error, metrics[3].mu_vol_r0_error);
-    printf("%-20s %12.4f %12.4f %12.4f %12.4f\n", "mu_vol R3 Error",
+           metrics[2].mu_vol_r0_error, metrics[3].mu_vol_r0_error, metrics[4].mu_vol_r0_error);
+    printf("%-20s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "mu_vol R3 Error",
            metrics[0].mu_vol_r3_error, metrics[1].mu_vol_r3_error,
-           metrics[2].mu_vol_r3_error, metrics[3].mu_vol_r3_error);
-    printf("═══════════════════════════════════════════════════════════════\n");
+           metrics[2].mu_vol_r3_error, metrics[3].mu_vol_r3_error, metrics[4].mu_vol_r3_error);
+    printf("════════════════════════════════════════════════════════════════════════════\n");
 
     /* Scenario breakdown */
     printf("\nSCENARIO BREAKDOWN (Regime Accuracy %%)\n");
-    printf("───────────────────────────────────────────────────────────────\n");
+    printf("────────────────────────────────────────────────────────────────────────────\n");
 
     const char *scenario_names[] = {
         "1. Calm",
@@ -855,8 +883,8 @@ int main(int argc, char **argv)
         "6. Flash Crash",
         "7. Choppy"};
 
-    printf("%-20s %12s %12s %12s %12s\n", "Scenario", "Baseline", "Liu-West", "Storvik", "Storvik+APF");
-    printf("───────────────────────────────────────────────────────────────\n");
+    printf("%-20s %10s %10s %10s %10s %12s\n", "Scenario", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+APF");
+    printf("────────────────────────────────────────────────────────────────────────────\n");
 
     for (int s = 0; s < data->n_scenarios; s++)
     {
@@ -864,26 +892,27 @@ int main(int argc, char **argv)
         int end = (s + 1 < data->n_scenarios) ? data->scenario_starts[s + 1] : n;
         int count = end - start;
 
-        int correct[4] = {0, 0, 0, 0};
+        int correct[NUM_MODES] = {0};
         for (int t = start; t < end; t++)
         {
-            for (int m = 0; m < 4; m++)
+            for (int m = 0; m < NUM_MODES; m++)
             {
                 if (records[m][t].est_regime == data->true_regime[t])
                     correct[m]++;
             }
         }
 
-        printf("%-20s %11.1f%% %11.1f%% %11.1f%% %11.1f%%\n", scenario_names[s],
+        printf("%-20s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%%\n", scenario_names[s],
                100.0 * correct[0] / count,
                100.0 * correct[1] / count,
                100.0 * correct[2] / count,
-               100.0 * correct[3] / count);
+               100.0 * correct[3] / count,
+               100.0 * correct[4] / count);
     }
-    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("════════════════════════════════════════════════════════════════════════════\n");
 
     /* Cleanup */
-    for (int m = 0; m < 4; m++)
+    for (int m = 0; m < NUM_MODES; m++)
         free(records[m]);
     free_synthetic_data(data);
 

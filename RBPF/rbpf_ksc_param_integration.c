@@ -121,6 +121,25 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     }
 
     /*═══════════════════════════════════════════════════════════════════════
+     * TRANSITION MATRIX LEARNING (Disabled by default)
+     *═══════════════════════════════════════════════════════════════════════*/
+    ext->trans_learn_enabled = 0;
+    ext->trans_forgetting = 0.995;
+    ext->trans_prior_diag = 50.0;
+    ext->trans_prior_off = 1.0;
+    ext->trans_update_interval = 100;
+    ext->trans_ticks_since_update = 0;
+
+    /* Zero-init transition counts (calloc already did this, but be explicit) */
+    for (int i = 0; i < RBPF_MAX_REGIMES; i++)
+    {
+        for (int j = 0; j < RBPF_MAX_REGIMES; j++)
+        {
+            ext->trans_counts[i][j] = 0.0;
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
      * CONFIGURE PER-PARTICLE PARAMETER MODE
      *
      * Option B: Decouple "reading per-particle arrays" from "Liu-West logic"
@@ -290,6 +309,76 @@ void rbpf_ext_signal_structural_break(RBPF_Extended *ext)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * TRANSITION MATRIX LEARNING - PUBLIC API
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void rbpf_ext_enable_transition_learning(RBPF_Extended *ext, int enable)
+{
+    if (!ext)
+        return;
+    ext->trans_learn_enabled = enable;
+
+    if (enable)
+    {
+        /* Reset counts when enabling */
+        rbpf_ext_reset_transition_counts(ext);
+    }
+}
+
+void rbpf_ext_configure_transition_learning(RBPF_Extended *ext,
+                                            double forgetting,
+                                            double prior_diag,
+                                            double prior_off,
+                                            int update_interval)
+{
+    if (!ext)
+        return;
+
+    ext->trans_forgetting = forgetting;
+    ext->trans_prior_diag = prior_diag;
+    ext->trans_prior_off = prior_off;
+    ext->trans_update_interval = update_interval;
+}
+
+void rbpf_ext_reset_transition_counts(RBPF_Extended *ext)
+{
+    if (!ext)
+        return;
+
+    for (int i = 0; i < RBPF_MAX_REGIMES; i++)
+    {
+        for (int j = 0; j < RBPF_MAX_REGIMES; j++)
+        {
+            ext->trans_counts[i][j] = 0.0;
+        }
+    }
+    ext->trans_ticks_since_update = 0;
+}
+
+double rbpf_ext_get_transition_prob(const RBPF_Extended *ext, int from, int to)
+{
+    if (!ext || !ext->rbpf)
+        return 0.0;
+    if (from < 0 || from >= ext->rbpf->n_regimes)
+        return 0.0;
+    if (to < 0 || to >= ext->rbpf->n_regimes)
+        return 0.0;
+
+    /* Compute current probability from counts + priors */
+    int nr = ext->rbpf->n_regimes;
+    double prior = (from == to) ? ext->trans_prior_diag : ext->trans_prior_off;
+
+    double row_sum = 0.0;
+    for (int j = 0; j < nr; j++)
+    {
+        double p = (from == j) ? ext->trans_prior_diag : ext->trans_prior_off;
+        row_sum += ext->trans_counts[from][j] + p;
+    }
+
+    return (ext->trans_counts[from][to] + prior) / row_sum;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * INTERNAL: Extract particle info for Storvik
  *
  * CRITICAL: When resampled=true, rbpf->mu[i] is a CHILD of rbpf->indices[i].
@@ -366,6 +455,92 @@ static void sync_storvik_to_rbpf(RBPF_Extended *ext)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * TRANSITION MATRIX LEARNING - INTERNAL HELPERS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * Update transition counts from particle regime changes
+ *
+ * Called after each step. Uses exponential forgetting to allow adaptation.
+ */
+static void update_transition_counts(RBPF_Extended *ext)
+{
+    if (!ext->trans_learn_enabled)
+        return;
+
+    RBPF_KSC *rbpf = ext->rbpf;
+    int n = rbpf->n_particles;
+    int nr = rbpf->n_regimes;
+    double forget = ext->trans_forgetting;
+
+    /* Decay old counts (exponential moving average behavior) */
+    for (int i = 0; i < nr; i++)
+    {
+        for (int j = 0; j < nr; j++)
+        {
+            ext->trans_counts[i][j] *= forget;
+        }
+    }
+
+    /* Accumulate new transitions from particles (equally weighted) */
+    double weight_share = 1.0 / n;
+
+    for (int k = 0; k < n; k++)
+    {
+        int current_r = rbpf->regime[k];
+        int prev_r = ext->prev_regime[k];
+
+        /* Bounds check */
+        if (prev_r >= 0 && prev_r < nr && current_r >= 0 && current_r < nr)
+        {
+            ext->trans_counts[prev_r][current_r] += weight_share;
+        }
+    }
+}
+
+/**
+ * Rebuild the transition LUT from learned counts
+ *
+ * Converts counts to probabilities using Dirichlet-Multinomial posterior:
+ *   P_ij = (N_ij + prior) / sum_k(N_ik + prior)
+ */
+static void rebuild_transition_lut(RBPF_Extended *ext)
+{
+    if (!ext->trans_learn_enabled)
+        return;
+
+    RBPF_KSC *rbpf = ext->rbpf;
+    int nr = rbpf->n_regimes;
+    rbpf_real_t flat_matrix[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
+
+    double prior_diag = ext->trans_prior_diag;
+    double prior_off = ext->trans_prior_off;
+
+    for (int i = 0; i < nr; i++)
+    {
+        double row_sum = 0.0;
+
+        /* Sum row including priors */
+        for (int j = 0; j < nr; j++)
+        {
+            double prior = (i == j) ? prior_diag : prior_off;
+            row_sum += ext->trans_counts[i][j] + prior;
+        }
+
+        /* Normalize to probabilities */
+        for (int j = 0; j < nr; j++)
+        {
+            double prior = (i == j) ? prior_diag : prior_off;
+            double count = ext->trans_counts[i][j] + prior;
+            flat_matrix[i * nr + j] = (rbpf_real_t)(count / row_sum);
+        }
+    }
+
+    /* Push to core filter */
+    rbpf_ksc_build_transition_lut(rbpf, flat_matrix);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * MAIN UPDATE
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -418,7 +593,28 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 3: Update lag buffers for next tick
+     * STEP 3: Update transition matrix learning (if enabled)
+     *
+     * Must run BEFORE prev_regime is updated, since we need:
+     *   prev_regime[k] = regime before this step
+     *   rbpf->regime[k] = regime after this step
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (ext->trans_learn_enabled)
+    {
+        update_transition_counts(ext);
+
+        /* Rebuild LUT periodically or on structural break */
+        ext->trans_ticks_since_update++;
+        if (ext->trans_ticks_since_update >= ext->trans_update_interval ||
+            ext->structural_break_signaled)
+        {
+            rebuild_transition_lut(ext);
+            ext->trans_ticks_since_update = 0;
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 4: Update lag buffers for next tick
      *═══════════════════════════════════════════════════════════════════════*/
     for (int i = 0; i < n; i++)
     {
@@ -427,12 +623,12 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 4: Sync learned params back to RBPF (if Storvik mode)
+     * STEP 5: Sync learned params back to RBPF (if Storvik mode)
      *═══════════════════════════════════════════════════════════════════════*/
     sync_storvik_to_rbpf(ext);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 5: Populate learned params in output
+     * STEP 6: Populate learned params in output
      *═══════════════════════════════════════════════════════════════════════*/
     for (int r = 0; r < rbpf->n_regimes; r++)
     {
@@ -536,7 +732,23 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 3: Update lag buffers for next tick
+     * STEP 3: Update transition matrix learning (if enabled)
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (ext->trans_learn_enabled)
+    {
+        update_transition_counts(ext);
+
+        ext->trans_ticks_since_update++;
+        if (ext->trans_ticks_since_update >= ext->trans_update_interval ||
+            ext->structural_break_signaled)
+        {
+            rebuild_transition_lut(ext);
+            ext->trans_ticks_since_update = 0;
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 4: Update lag buffers for next tick
      *═══════════════════════════════════════════════════════════════════════*/
     for (int i = 0; i < n; i++)
     {
@@ -545,12 +757,12 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 4: Sync learned params back to RBPF (if Storvik mode)
+     * STEP 5: Sync learned params back to RBPF (if Storvik mode)
      *═══════════════════════════════════════════════════════════════════════*/
     sync_storvik_to_rbpf(ext);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 5: Populate learned params in output
+     * STEP 6: Populate learned params in output
      *═══════════════════════════════════════════════════════════════════════*/
     for (int r = 0; r < n_regimes; r++)
     {
