@@ -434,44 +434,117 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
 
     RBPF_KSC *rbpf = ext->rbpf;
     int n = rbpf->n_particles;
+    int n_regimes = rbpf->n_regimes;
 
-    /* Signal structural break if flagged */
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 0: Signal structural break if flagged
+     *═══════════════════════════════════════════════════════════════════════*/
     if (ext->structural_break_signaled && ext->storvik_initialized)
     {
         param_learn_signal_structural_break(&ext->storvik);
         ext->structural_break_signaled = 0;
     }
 
-    /* Run APF step */
-    rbpf_ksc_step_apf(rbpf, obs_current, obs_next, output);
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 1: Run APF step WITH INDEX OUTPUT
+     *
+     * CRITICAL: We need the resample indices to apply the SAME resampling
+     * to Storvik per-particle arrays. Without this, particle states and
+     * their learned parameters become misaligned → NaN/garbage.
+     *═══════════════════════════════════════════════════════════════════════*/
 
-    /* Update Storvik */
+    /* Allocate indices on stack (reasonable for n ≤ 2048) */
+    int resample_indices[2048];
+    int *indices = (n <= 2048) ? resample_indices : (int *)malloc(n * sizeof(int));
+
+    /* Use indexed APF step - returns resample indices */
+    rbpf_ksc_step_apf_indexed(rbpf, obs_current, obs_next, output, indices);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 2: Extract particle info BEFORE resampling Storvik
+     *
+     * Note: APF already resampled RBPF arrays in rbpf_ksc_step_apf_indexed().
+     * But we need to update Storvik BEFORE applying the same resampling.
+     *═══════════════════════════════════════════════════════════════════════*/
     if (ext->storvik_initialized)
     {
+        /* Extract from RESAMPLED RBPF state (post-APF resample) */
         extract_particle_info(ext);
+
+        /* Update Storvik sufficient statistics */
         param_learn_update(&ext->storvik, ext->particle_info, n);
 
+        /* Apply SAME resample indices to Storvik arrays
+         * This keeps particle_mu_vol[i] aligned with rbpf->mu[i] */
         if (output->resampled)
         {
-            param_learn_apply_resampling(&ext->storvik, rbpf->indices, n);
+            param_learn_apply_resampling(&ext->storvik, indices, n);
+        }
+
+        /*═══════════════════════════════════════════════════════════════════
+         * STEP 2b: Also resample RBPF per-particle param arrays
+         *
+         * CRITICAL FIX: rbpf->particle_mu_vol and particle_sigma_vol must
+         * be resampled with the same indices as mu/var/regime!
+         *═══════════════════════════════════════════════════════════════════*/
+        if (output->resampled && rbpf->particle_mu_vol && rbpf->particle_sigma_vol)
+        {
+            /* Use scratch space for double buffering */
+            rbpf_real_t *mu_vol_new = (rbpf_real_t *)malloc(n * n_regimes * sizeof(rbpf_real_t));
+            rbpf_real_t *sigma_vol_new = (rbpf_real_t *)malloc(n * n_regimes * sizeof(rbpf_real_t));
+
+            if (mu_vol_new && sigma_vol_new)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    int src = indices[i];
+                    for (int r = 0; r < n_regimes; r++)
+                    {
+                        int dst_idx = i * n_regimes + r;
+                        int src_idx = src * n_regimes + r;
+                        mu_vol_new[dst_idx] = rbpf->particle_mu_vol[src_idx];
+                        sigma_vol_new[dst_idx] = rbpf->particle_sigma_vol[src_idx];
+                    }
+                }
+
+                /* Copy back */
+                memcpy(rbpf->particle_mu_vol, mu_vol_new, n * n_regimes * sizeof(rbpf_real_t));
+                memcpy(rbpf->particle_sigma_vol, sigma_vol_new, n * n_regimes * sizeof(rbpf_real_t));
+            }
+
+            free(mu_vol_new);
+            free(sigma_vol_new);
         }
     }
 
-    /* Update lag buffers */
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 3: Update lag buffers for next tick
+     *═══════════════════════════════════════════════════════════════════════*/
     for (int i = 0; i < n; i++)
     {
         ext->ell_lag_buffer[i] = rbpf->mu[i];
         ext->prev_regime[i] = rbpf->regime[i];
     }
 
-    /* Sync and populate output */
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 4: Sync learned params back to RBPF (if Storvik mode)
+     *═══════════════════════════════════════════════════════════════════════*/
     sync_storvik_to_rbpf(ext);
 
-    for (int r = 0; r < rbpf->n_regimes; r++)
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 5: Populate learned params in output
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (int r = 0; r < n_regimes; r++)
     {
         rbpf_ext_get_learned_params(ext, r,
                                     &output->learned_mu_vol[r],
                                     &output->learned_sigma_vol[r]);
+    }
+
+    /* Cleanup if we allocated dynamically */
+    if (n > 2048)
+    {
+        free(indices);
     }
 }
 

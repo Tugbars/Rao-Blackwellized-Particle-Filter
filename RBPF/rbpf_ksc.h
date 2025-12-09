@@ -472,7 +472,7 @@ typedef float rbpf_real_t;
         rbpf_real_t uniform_weight; /* 1/n */
         rbpf_real_t inv_n;
 
-        int use_learned_params;  // 1 = predict reads particle_mu/sigma_vol arrays
+        int use_learned_params; // 1 = predict reads particle_mu/sigma_vol arrays
 
     } RBPF_KSC;
 
@@ -788,6 +788,61 @@ typedef float rbpf_real_t;
     void rbpf_pipeline_print_signal(const RBPF_Signal *sig);
 
     void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable);
+
+    /**
+     * @brief APF step with resample index output (for Storvik integration)
+     *
+     * Same as rbpf_ksc_step_apf but returns the resample indices, allowing
+     * external code to apply the same resampling to additional arrays.
+     *
+     * CRITICAL for Storvik: Without consistent resampling of per-particle
+     * parameter arrays, particle states and learned params become misaligned.
+     *
+     * @param rbpf              RBPF context
+     * @param obs_current       Current observation (raw return r_t)
+     * @param obs_next          Next observation (raw return r_{t+1}) for lookahead
+     * @param out               Output structure
+     * @param resample_indices_out  Output: index[i] = which source particle new particle i came from
+     */
+    void rbpf_ksc_step_apf_indexed(
+        RBPF_KSC *rbpf,
+        rbpf_real_t obs_current,
+        rbpf_real_t obs_next,
+        RBPF_KSC_Output *out,
+        int *resample_indices_out);
+
+    /**
+     * @brief Compute APF resample indices without applying
+     *
+     * Useful when you need to resample multiple array sets with the same indices.
+     *
+     * @param rbpf                  RBPF context
+     * @param log_weight_combined   Combined APF weights [n_particles]
+     * @param indices_out           Output: resample indices [n_particles]
+     */
+    void rbpf_ksc_apf_compute_resample_indices(
+        RBPF_KSC *rbpf,
+        const rbpf_real_t *log_weight_combined,
+        int *indices_out);
+
+    /**
+     * @brief Apply pre-computed resample indices to RBPF arrays
+     *
+     * @param rbpf     RBPF context
+     * @param indices  Resample indices from rbpf_ksc_apf_compute_resample_indices
+     */
+    void rbpf_ksc_apf_apply_resample_indices(
+        RBPF_KSC *rbpf,
+        const int *indices);
+
+    /**
+     * @brief Get last computed resample indices
+     *
+     * @param indices_out  Output buffer
+     * @param max_n        Max indices to copy
+     * @return Number of indices copied, or 0 if none available
+     */
+    int rbpf_ksc_apf_get_resample_indices(int *indices_out, int max_n);
 
 #ifdef __cplusplus
 }
