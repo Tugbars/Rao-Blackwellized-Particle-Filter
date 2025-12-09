@@ -106,12 +106,7 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     if (mode == RBPF_PARAM_STORVIK || mode == RBPF_PARAM_HYBRID)
     {
         ParamLearnConfig cfg = param_learn_config_defaults();
-
-        /* Default intervals: sleep in calm, wake in crisis */
-        cfg.sample_interval[0] = 50; /* R0: every 50 ticks */
-        cfg.sample_interval[1] = 20; /* R1: every 20 ticks */
-        cfg.sample_interval[2] = 5;  /* R2: every 5 ticks */
-        cfg.sample_interval[3] = 1;  /* R3: every tick */
+        /* defaults() now returns always-awake (all intervals = 1) */
 
         cfg.sample_on_regime_change = true;
         cfg.sample_on_structural_break = true;
@@ -203,7 +198,9 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
         for (int r = 0; r < nr; r++)
         {
             const RBPF_RegimeParams *p = &ext->rbpf->params[r];
-            param_learn_set_prior(&ext->storvik, r, p->mu_vol, p->theta, p->sigma_vol);
+            /* CRITICAL: Convert θ (mean reversion) → φ (persistence) */
+            rbpf_real_t phi = RBPF_REAL(1.0) - p->theta;
+            param_learn_set_prior(&ext->storvik, r, p->mu_vol, phi, p->sigma_vol);
         }
         param_learn_broadcast_priors(&ext->storvik);
 
@@ -228,10 +225,14 @@ void rbpf_ext_set_regime_params(RBPF_Extended *ext, int regime,
     /* Set in RBPF */
     rbpf_ksc_set_regime_params(ext->rbpf, regime, theta, mu_vol, sigma_vol);
 
-    /* Set in Storvik */
+    /* Set in Storvik
+     * CRITICAL: Storvik uses φ (persistence), RBPF uses θ (mean reversion)
+     * Relationship: φ = 1 - θ
+     */
     if (ext->storvik_initialized)
     {
-        param_learn_set_prior(&ext->storvik, regime, mu_vol, theta, sigma_vol);
+        rbpf_real_t phi = RBPF_REAL(1.0) - theta;
+        param_learn_set_prior(&ext->storvik, regime, mu_vol, phi, sigma_vol);
     }
 }
 
@@ -259,7 +260,7 @@ void rbpf_ext_set_hft_mode(RBPF_Extended *ext, int enable)
 
     if (enable)
     {
-        /* HFT: Less frequent sampling in calm markets */
+        /* HFT: Sleeping mode for lower latency (~28μs) */
         ext->storvik.config.sample_interval[0] = 100; /* R0: every 100 ticks */
         ext->storvik.config.sample_interval[1] = 50;  /* R1: every 50 ticks */
         ext->storvik.config.sample_interval[2] = 20;  /* R2: every 20 ticks */
@@ -267,10 +268,10 @@ void rbpf_ext_set_hft_mode(RBPF_Extended *ext, int enable)
     }
     else
     {
-        /* Standard: More frequent sampling */
-        ext->storvik.config.sample_interval[0] = 50;
-        ext->storvik.config.sample_interval[1] = 20;
-        ext->storvik.config.sample_interval[2] = 5;
+        /* Standard: Always-awake for best tracking (~45μs) */
+        ext->storvik.config.sample_interval[0] = 1;
+        ext->storvik.config.sample_interval[1] = 1;
+        ext->storvik.config.sample_interval[2] = 1;
         ext->storvik.config.sample_interval[3] = 1;
     }
 }
@@ -290,9 +291,12 @@ void rbpf_ext_signal_structural_break(RBPF_Extended *ext)
 
 /*═══════════════════════════════════════════════════════════════════════════
  * INTERNAL: Extract particle info for Storvik
+ *
+ * CRITICAL: When resampled=true, rbpf->mu[i] is a CHILD of rbpf->indices[i].
+ * We must look up the PARENT's lag value, not index i's lag value.
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static void extract_particle_info(RBPF_Extended *ext)
+static void extract_particle_info(RBPF_Extended *ext, int resampled)
 {
     RBPF_KSC *rbpf = ext->rbpf;
     int n = rbpf->n_particles;
@@ -319,10 +323,14 @@ static void extract_particle_info(RBPF_Extended *ext)
         ParticleInfo *p = &ext->particle_info[i];
 
         p->regime = rbpf->regime[i];
-        p->prev_regime = ext->prev_regime[i];
-        p->ell = rbpf->mu[i];                /* Current log-vol estimate */
-        p->ell_lag = ext->ell_lag_buffer[i]; /* Previous log-vol estimate */
-        p->weight *= inv_sum;                /* Normalize */
+        p->ell = rbpf->mu[i]; /* Current log-vol (already shuffled) */
+
+        /* LINEAGE FIX: Look up correct parent after resampling */
+        int parent_idx = resampled ? rbpf->indices[i] : i;
+        p->ell_lag = ext->ell_lag_buffer[parent_idx];
+        p->prev_regime = ext->prev_regime[parent_idx];
+
+        p->weight *= inv_sum; /* Normalize */
     }
 }
 
@@ -379,26 +387,34 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 1: Run RBPF-KSC update
+     * STEP 1: Run RBPF-KSC update (may resample internally!)
      *═══════════════════════════════════════════════════════════════════════*/
     rbpf_ksc_step(rbpf, obs, output);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 2: Extract particle info and update Storvik
+     * STEP 2: Update Storvik with CORRECT ORDER
+     *
+     * CRITICAL: If RBPF resampled, rbpf->mu is now permuted but Storvik
+     * stats are not. We must align Storvik stats BEFORE updating them.
+     *
+     * Order:
+     *   1. If resampled: permute Storvik stats to match new particle order
+     *   2. Extract particle info (with lineage fix for ell_lag)
+     *   3. Update Storvik stats (now aligned)
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->storvik_initialized)
     {
-        /* Extract particle info from RBPF state */
-        extract_particle_info(ext);
-
-        /* Update Storvik (stats always, samples conditionally) */
-        param_learn_update(&ext->storvik, ext->particle_info, n);
-
-        /* If resample occurred, sync Storvik ancestors */
+        /* STEP 2a: Align Storvik stats to match permuted RBPF state */
         if (output->resampled)
         {
             param_learn_apply_resampling(&ext->storvik, rbpf->indices, n);
         }
+
+        /* STEP 2b: Extract particle info (pass resampled for lineage fix) */
+        extract_particle_info(ext, output->resampled);
+
+        /* STEP 2c: Update Storvik stats (now everything is aligned) */
+        param_learn_update(&ext->storvik, ext->particle_info, n);
     }
 
     /*═══════════════════════════════════════════════════════════════════════
@@ -461,28 +477,30 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
     rbpf_ksc_step_apf_indexed(rbpf, obs_current, obs_next, output, indices);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 2: Extract particle info BEFORE resampling Storvik
+     * STEP 2: Update Storvik with CORRECT ORDER
      *
-     * Note: APF already resampled RBPF arrays in rbpf_ksc_step_apf_indexed().
-     * But we need to update Storvik BEFORE applying the same resampling.
+     * CRITICAL: APF already resampled RBPF arrays. We must:
+     *   1. Align Storvik stats to match new particle order FIRST
+     *   2. Extract particle info with lineage fix
+     *   3. Update stats (now aligned)
+     *   4. Also resample RBPF per-particle param arrays
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->storvik_initialized)
     {
-        /* Extract from RESAMPLED RBPF state (post-APF resample) */
-        extract_particle_info(ext);
-
-        /* Update Storvik sufficient statistics */
-        param_learn_update(&ext->storvik, ext->particle_info, n);
-
-        /* Apply SAME resample indices to Storvik arrays
-         * This keeps particle_mu_vol[i] aligned with rbpf->mu[i] */
+        /* STEP 2a: Align Storvik stats BEFORE update */
         if (output->resampled)
         {
             param_learn_apply_resampling(&ext->storvik, indices, n);
         }
 
+        /* STEP 2b: Extract particle info with lineage fix */
+        extract_particle_info(ext, output->resampled);
+
+        /* STEP 2c: Update Storvik sufficient statistics */
+        param_learn_update(&ext->storvik, ext->particle_info, n);
+
         /*═══════════════════════════════════════════════════════════════════
-         * STEP 2b: Also resample RBPF per-particle param arrays
+         * STEP 2d: Also resample RBPF per-particle param arrays
          *
          * CRITICAL FIX: rbpf->particle_mu_vol and particle_sigma_vol must
          * be resampled with the same indices as mu/var/regime!
