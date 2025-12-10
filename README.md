@@ -1,8 +1,32 @@
-# Rao-Blackwellized Particle Filter (RBPF-KSC)
+# ROCKS: Robust Online Conjugate KSC-Storvik
 
-**Real-time stochastic volatility tracking for high-frequency trading**
+**Real-time stochastic volatility tracking for high-frequency trading with fat-tail resilience**
 
-A production-grade particle filter implementation using the Kim-Shephard-Chib (1998) observation model with Omori et al. (2007) 10-component mixture approximation. Optimized for sub-20μs latency on Intel CPUs.
+A production-grade Rao-Blackwellized particle filter combining:
+
+- **Kim-Shephard-Chib (1998)** observation model with **Omori et al. (2007)** 10-component Gaussian mixture approximation
+- **Storvik (2002)** online sufficient statistics for conjugate parameter learning
+- **Robust OCSN likelihood** with automatic outlier detection and downweighting (handles 6-15σ events)
+- **Adaptive forgetting** (RiskMetrics-style exponential discounting) to prevent posterior fossilization
+- **SIMD-optimized** likelihood computation (AVX2/AVX-512)
+
+## Key Features
+
+| Feature | Benefit |
+|---------|---------|
+| Robust OCSN | Survives flash crashes without particle collapse |
+| Sleeping Storvik | Regime-adaptive sampling intervals for P99 latency control |
+| Adaptive Forgetting | Tracks non-stationary volatility dynamics |
+| Double-buffered resampling | Zero-copy pointer swap |
+
+## Performance
+
+- **Avg latency**: ~20-55μs (depending on configuration)
+- **P99 latency**: <120μs
+- **Outlier RMSE**: 0.73 (vs 1.55 baseline)
+- **Regime accuracy**: 70% across calm/crisis/recovery scenarios
+
+Optimized for Intel CPUs (Haswell+). Tested against 12σ flash crashes and fat-tailed crisis regimes.
 <img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
