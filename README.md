@@ -47,9 +47,9 @@ Optimized for Intel CPUs (Haswell+). Tested against 12σ flash crashes and fat-t
 
 ## Log-Vol Tracking Accuracy:
 
-```
+
 <img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
-```
+
 
 ### Why Rao-Blackwellization?
 
