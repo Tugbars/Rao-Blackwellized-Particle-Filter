@@ -25,14 +25,14 @@
  * Transform:   y_t = log(r_t²) = 2ℓ_t + log(ε_t²)
  * Linear form: y_t = H·ℓ_t + noise,  where H = 2
  *
- * log(ε_t²) ~ log-χ²(1), approximated as 7-component Gaussian mixture (KSC 1998).
+ * log(ε_t²) ~ log-χ²(1), approximated as 10-component Gaussian mixture (OCSN).
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * GPB1 APPROXIMATION
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * True posterior is mixture of 7^T Gaussians (exponential growth).
- * We use Generalized Pseudo-Bayesian 1 (GPB1): collapse 7→1 each timestep.
+ * True posterior is mixture of 10^T Gaussians (exponential growth).
+ * We use Generalized Pseudo-Bayesian 1 (GPB1): collapse 10→1 each timestep.
  *
  * Variance calculation uses law of total variance:
  *   Var[X] = E[Var[X|K]] + Var[E[X|K]] = E[X²] - E[X]²
@@ -356,6 +356,40 @@ typedef float rbpf_real_t;
         int confirm_major;         /* Required consecutive for major alert (default: 2) */
     } RBPF_Detection;
 
+    /*═══════════════════════════════════════════════════════════════════════════
+     * ROBUST OCSN (11TH COMPONENT)
+     *
+     * Adds outlier-handling to the 10-component OCSN mixture.
+     * P(obs) = (1 - π_outlier) × P_OCSN(obs) + π_outlier × P_broad(obs)
+     *
+     * Prevents particle collapse during 8σ+ moves.
+     *
+     * VARIANCE BOUNDS (Critical for Signal Preservation):
+     *   Max OCSN variance = 7.33
+     *   Recommended outlier variance = 2-4× max OCSN ≈ 15-30
+     *
+     *   Too low (<15):  Outlier competes with OCSN, distorts normal updates
+     *   Too high (>50): Kalman gain → 0, signal suppression (ignores crash)
+     *   Sweet spot:     ~22 (3× OCSN max) for most assets
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+/* Variance bounds for safety */
+#define RBPF_OUTLIER_VAR_MIN RBPF_REAL(12.0)     /* 1.6× max OCSN */
+#define RBPF_OUTLIER_VAR_MAX RBPF_REAL(50.0)     /* 7× max OCSN */
+#define RBPF_OUTLIER_VAR_DEFAULT RBPF_REAL(22.0) /* 3× max OCSN - sweet spot */
+
+    typedef struct
+    {
+        rbpf_real_t prob;     /* Outlier probability (e.g., 0.01 = 1%) */
+        rbpf_real_t variance; /* Outlier variance (recommended: 15-35) */
+    } RBPF_OutlierParams;
+
+    typedef struct
+    {
+        int enabled;
+        RBPF_OutlierParams regime[RBPF_MAX_REGIMES]; /* Per-regime params */
+    } RBPF_RobustOCSN;
+
     /**
      * Main RBPF-KSC structure
      */
@@ -376,6 +410,9 @@ typedef float rbpf_real_t;
         rbpf_real_t *mu_tmp;
         rbpf_real_t *var_tmp;
         int *regime_tmp;
+
+        /* Alias for compatibility: some code uses weight instead of log_weight */
+        rbpf_real_t *weight; /* Points to w_norm after normalization */
 
         /*========================================================================
          * REGIME SYSTEM
@@ -472,7 +509,7 @@ typedef float rbpf_real_t;
         rbpf_real_t uniform_weight; /* 1/n */
         rbpf_real_t inv_n;
 
-        int use_learned_params; // 1 = predict reads particle_mu/sigma_vol arrays
+        int use_learned_params; /* 1 = predict reads particle_mu/sigma_vol arrays */
 
     } RBPF_KSC;
 
@@ -617,6 +654,35 @@ typedef float rbpf_real_t;
     int rbpf_ksc_resample(RBPF_KSC *rbpf);
     void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
                                   RBPF_KSC_Output *out);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * ROBUST OCSN UPDATE (11th Component)
+     *
+     * Modified Kalman update that adds an outlier component to the mixture.
+     * Prevents particle collapse during extreme observations (8σ+ moves).
+     *
+     * @param rbpf        RBPF context
+     * @param y           Transformed observation: y = log(r²)
+     * @param robust_ocsn Robust OCSN configuration (per-regime outlier params)
+     * @return            Marginal likelihood p(y_t | y_{1:t-1})
+     *───────────────────────────────────────────────────────────────────────────*/
+    rbpf_real_t rbpf_ksc_update_robust(RBPF_KSC *rbpf, rbpf_real_t y,
+                                       const RBPF_RobustOCSN *robust_ocsn);
+
+    /**
+     * Compute outlier fraction for diagnostics
+     *
+     * Returns the fraction of likelihood explained by the outlier component.
+     * High values (>0.5) indicate the observation was treated as an outlier.
+     *
+     * @param rbpf        RBPF context
+     * @param y           Transformed observation: y = log(r²)
+     * @param robust_ocsn Robust OCSN configuration
+     * @return            Outlier fraction [0, 1]
+     */
+    rbpf_real_t rbpf_ksc_compute_outlier_fraction(const RBPF_KSC *rbpf,
+                                                  rbpf_real_t y,
+                                                  const RBPF_RobustOCSN *robust_ocsn);
 
     /*─────────────────────────────────────────────────────────────────────────────
      * APF (Auxiliary Particle Filter) API
