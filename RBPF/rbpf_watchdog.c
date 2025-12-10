@@ -604,12 +604,14 @@ int rbpf_watchdog_reset(RBPF_Extended *ext, RBPF_Watchdog *wd,
 
             /* Add Gaussian jitter using internal RNG (deterministic) */
             float jitter_scale = 0.1f * sqrtf(fmaxf(h_var_before, 0.01f));
-            uint64_t rng_state = ext->tick_count ^ 0xDEADBEEF; /* Seed from tick */
+
+            /* Seed with tick + total_resets to ensure fresh entropy on repeated resets */
+            uint64_t rng_state = ext->tick_count ^ (wd->total_resets * 0x9E3779B97F4A7C15ULL) ^ 0xDEADBEEF;
 
             for (int i = 0; i < n; i++)
             {
                 float noise = wd_gaussian(&rng_state);
-                rbpf->h[i] += jitter_scale * noise;
+                rbpf->mu[i] += jitter_scale * noise;
             }
 
             /* Re-equalize weights */
@@ -647,16 +649,16 @@ int rbpf_watchdog_reset(RBPF_Extended *ext, RBPF_Watchdog *wd,
                 h_std = 2.0f; /* Cap explosion */
             }
 
-            /* Use internal RNG for deterministic reset */
-            uint64_t rng_state = ext->tick_count ^ 0xCAFEBABE;
+            /* Seed with tick + total_resets for fresh entropy on repeated resets */
+            uint64_t rng_state = ext->tick_count ^ (wd->total_resets * 0x9E3779B97F4A7C15ULL) ^ 0xCAFEBABE;
 
             /* Re-initialize particles */
             for (int i = 0; i < n; i++)
             {
                 float noise = wd_gaussian(&rng_state);
 
-                rbpf->h[i] = h_center + h_std * noise;
-                rbpf->P[i] = h_std * h_std;
+                rbpf->mu[i] = h_center + h_std * noise;
+                rbpf->var[i] = h_std * h_std;
                 rbpf->weight[i] = 1.0f / (float)n;
 
                 /* Regime diversity (don't lock all particles in one regime) */
@@ -681,15 +683,15 @@ int rbpf_watchdog_reset(RBPF_Extended *ext, RBPF_Watchdog *wd,
             float h_init = -4.0f; /* ~2% vol */
             float P_init = 1.0f;  /* Wide uncertainty */
 
-            /* Use internal RNG for deterministic reset */
-            uint64_t rng_state = ext->tick_count ^ 0xDEADC0DE;
+            /* Seed with tick + total_resets for fresh entropy on repeated resets */
+            uint64_t rng_state = ext->tick_count ^ (wd->total_resets * 0x9E3779B97F4A7C15ULL) ^ 0xDEADC0DE;
 
             for (int i = 0; i < n; i++)
             {
                 float noise = wd_gaussian(&rng_state);
 
-                rbpf->h[i] = h_init + sqrtf(P_init) * noise;
-                rbpf->P[i] = P_init;
+                rbpf->mu[i] = h_init + sqrtf(P_init) * noise;
+                rbpf->var[i] = P_init;
                 rbpf->weight[i] = 1.0f / (float)n;
                 rbpf->regime[i] = i % rbpf->n_regimes;
             }
