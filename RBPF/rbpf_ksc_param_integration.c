@@ -1495,7 +1495,12 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     } else {
         ext->last_outlier_fraction = RBPF_REAL(0.0);
     }
-
+    
+    /* Expose to output for diagnostics */
+    if (output) {
+        output->outlier_fraction = ext->last_outlier_fraction;
+    }
+    
     /*═══════════════════════════════════════════════════════════════════════
      * ADAPTIVE FORGETTING: Update λ based on predictive surprise
      * 

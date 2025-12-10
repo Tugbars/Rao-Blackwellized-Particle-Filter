@@ -44,7 +44,7 @@ static const rbpf_real_t DEFAULT_LAMBDA_REGIME[RBPF_MAX_REGIMES] = {
 #define DEFAULT_LAMBDA_CEILING RBPF_REAL(0.9995) /* N_eff ≈ 2000 maximum */
 
 /* EMA parameters */
-#define DEFAULT_BASELINE_ALPHA RBPF_REAL(0.02) /* Very slow (τ ≈ 50) */
+#define DEFAULT_BASELINE_ALPHA RBPF_REAL(0.01) /* Very slow (τ ≈ 100) - slow to adapt */
 #define DEFAULT_SIGNAL_ALPHA RBPF_REAL(0.15)   /* Faster reaction */
 
 /* Cooldown */
@@ -139,6 +139,16 @@ static inline rbpf_real_t sigmoid_discount(
  * Uses the marginal likelihood from the update step to compute surprise
  * and adjust the forgetting factor.
  *
+ * SEPARATION OF CONCERNS:
+ *   PATH A: Predictive Surprise (Drift Detection)
+ *     - Uses Z-score normalization (is today worse than yesterday?)
+ *     - Triggers on gradual regime shifts
+ *
+ *   PATH B: Structural Surprise (Shock Detection)
+ *     - Uses ABSOLUTE outlier fraction (no history needed)
+ *     - Triggers immediately on heavy outlier usage
+ *     - Bypasses Z-score entirely
+ *
  * @param ext              Extended RBPF handle
  * @param marginal_lik     Marginal likelihood from rbpf_ksc_update()
  * @param dominant_regime  Current dominant regime (for baseline λ)
@@ -160,184 +170,131 @@ void rbpf_adaptive_forgetting_update(
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 1: Compute Effective Surprise
+     * PATH A: PREDICTIVE SURPRISE (Drift Detection)
      *
-     * Two signal sources that BOTH indicate model misspecification:
-     *
-     * A) Predictive Surprise = -log p(y_t | y_{1:t-1})
-     *    High when: Data doesn't fit the model at all
-     *
-     * B) Structural Surprise = f(outlier_fraction)
-     *    High when: Data only fits because we're calling it an outlier
-     *
-     * The "Signal Starvation" Problem:
-     *   When Robust OCSN absorbs a shock, marginal likelihood stays decent
-     *   (because the outlier component explains it), so predictive surprise
-     *   stays low. But the model is still "cheating" by using the crutch.
-     *
-     * Solution: Take MAX of both signals. We adapt if EITHER:
-     *   - Data fits poorly (drift) → predictive surprise triggers
-     *   - Data fits via outlier (shock) → structural surprise triggers
+     * Uses Z-score to detect when data fits worse than usual.
+     * Good for: Gradual regime shifts, persistent misspecification
      *═══════════════════════════════════════════════════════════════════════*/
 
-    rbpf_real_t pred_surprise = RBPF_REAL(0.0);
-    rbpf_real_t struct_surprise = RBPF_REAL(0.0);
-    rbpf_real_t surprise;
-
-    /* A) Predictive Surprise from marginal likelihood */
-    if (af->signal_source != ADAPT_SIGNAL_OUTLIER_FRAC)
+    /* Compute predictive surprise */
+    if (marginal_lik < RBPF_REAL(1e-30))
     {
-        if (marginal_lik < RBPF_REAL(1e-30))
-        {
-            marginal_lik = RBPF_REAL(1e-30); /* Avoid log(0) */
-        }
-        pred_surprise = -rbpf_log(marginal_lik);
+        marginal_lik = RBPF_REAL(1e-30);
     }
+    rbpf_real_t pred_surprise = -rbpf_log(marginal_lik);
 
-    /* B) Structural Surprise from outlier usage */
-    /* Scale: 0% outlier → 0, 50% outlier → 2.5, 100% outlier → 5.0 */
-    /* This is calibrated so heavy outlier usage (~50%+) triggers intervention */
-    struct_surprise = ext->last_outlier_fraction * RBPF_REAL(5.0);
-
-    /* Combine signals based on mode */
-    switch (af->signal_source)
-    {
-    case ADAPT_SIGNAL_REGIME:
-        /* Pure regime-based, no surprise adaptation */
-        surprise = RBPF_REAL(0.0);
-        break;
-
-    case ADAPT_SIGNAL_OUTLIER_FRAC:
-        /* Only structural surprise (for testing) */
-        surprise = struct_surprise * RBPF_REAL(4.0); /* Scale up for standalone use */
-        break;
-
-    case ADAPT_SIGNAL_PREDICTIVE_SURPRISE:
-        /* Only predictive surprise (original behavior, for comparison) */
-        surprise = pred_surprise;
-        break;
-
-    case ADAPT_SIGNAL_COMBINED:
-    default:
-        /* ADDITIVE: Predictive + Outlier penalty
-         *
-         * Key insight: When OCSN absorbs a shock, pred_surprise stays low
-         * (because the model "explains" it via the outlier component).
-         * But we should PENALIZE relying on the crutch!
-         *
-         * Formula: surprise = pred_surprise + α × outlier_fraction²
-         *
-         * The quadratic term:
-         *   - 10% outlier → +0.1 (negligible, normal market noise)
-         *   - 30% outlier → +0.9 (moderate penalty, elevated vol)
-         *   - 50% outlier → +2.5 (strong penalty, regime break likely)
-         *   - 80% outlier → +6.4 (massive penalty, clear structural change)
-         *
-         * This ensures heavy outlier usage triggers adaptation even when
-         * the marginal likelihood looks "fine" because OCSN fit well.
-         */
-        {
-            rbpf_real_t outlier_penalty = ext->last_outlier_fraction *
-                                          ext->last_outlier_fraction *
-                                          RBPF_REAL(10.0);
-            surprise = pred_surprise + outlier_penalty;
-        }
-        break;
-    }
-
-    af->surprise_current = surprise;
+    af->surprise_current = pred_surprise;
 
     /* Track maximum for diagnostics */
-    if (surprise > af->max_surprise_seen)
+    if (pred_surprise > af->max_surprise_seen)
     {
-        af->max_surprise_seen = surprise;
+        af->max_surprise_seen = pred_surprise;
     }
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * STEP 2: Update Baseline Statistics
-     *
-     * We track what "normal" surprise looks like so we can detect anomalies.
-     * Use slow EMA to avoid chasing regime changes.
-     *═══════════════════════════════════════════════════════════════════════*/
-
+    /* Update baseline statistics (slow EMA, only when not intervening) */
     rbpf_real_t alpha_base = af->surprise_ema_alpha;
 
-    /* Only update baseline when NOT in intervention mode */
     if (af->cooldown_remaining == 0 && af->surprise_zscore < RBPF_REAL(1.0))
     {
-        /* Update baseline mean */
-        af->surprise_baseline = alpha_base * surprise +
+        af->surprise_baseline = alpha_base * pred_surprise +
                                 (RBPF_REAL(1.0) - alpha_base) * af->surprise_baseline;
 
-        /* Update baseline variance (for z-score calculation) */
-        rbpf_real_t delta = surprise - af->surprise_baseline;
+        rbpf_real_t delta = pred_surprise - af->surprise_baseline;
         af->surprise_var = alpha_base * (delta * delta) +
                            (RBPF_REAL(1.0) - alpha_base) * af->surprise_var;
 
-        /* Floor variance to prevent division issues */
         if (af->surprise_var < RBPF_REAL(0.01))
         {
             af->surprise_var = RBPF_REAL(0.01);
         }
     }
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * STEP 3: Compute Surprise Z-Score
-     *
-     * z = (surprise - baseline) / sqrt(variance)
-     *
-     * High z-score indicates observation is unusual given recent history.
-     *═══════════════════════════════════════════════════════════════════════*/
-
+    /* Compute Z-score */
     rbpf_real_t surprise_std = rbpf_sqrt(af->surprise_var);
-    af->surprise_zscore = (surprise - af->surprise_baseline) / (surprise_std + RBPF_REAL(1e-6));
+    af->surprise_zscore = (pred_surprise - af->surprise_baseline) / (surprise_std + RBPF_REAL(1e-6));
 
-    /* Smooth the signal for stability */
+    /* Smooth the Z-score signal */
     af->signal_ema = af->signal_ema_alpha * af->surprise_zscore +
                      (RBPF_REAL(1.0) - af->signal_ema_alpha) * af->signal_ema;
 
+    /* Compute discount from predictive surprise */
+    rbpf_real_t discount_pred = sigmoid_discount(af, af->signal_ema);
+
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 4: Compute Adaptive λ Based on Signal Source
+     * PATH B: STRUCTURAL SURPRISE (Shock Detection)
+     *
+     * Direct penalty based on outlier fraction. NO HISTORY NEEDED.
+     * This is ABSOLUTE - 80% outliers is always bad, period.
+     *
+     * Bypasses Z-score entirely to avoid the "Baseline Trap":
+     *   - Z-score normalizes everything relative to history
+     *   - But outlier fraction has an absolute meaning
+     *   - 80% outliers = crisis, even if yesterday was also 80%
      *═══════════════════════════════════════════════════════════════════════*/
 
-    rbpf_real_t lambda;
+    rbpf_real_t out_frac = ext->last_outlier_fraction;
+    rbpf_real_t discount_struct = RBPF_REAL(0.0);
+
+    /* Threshold-based activation:
+     *   <20% outliers: Normal market noise, no penalty
+     *   20-80% outliers: Linear ramp from 0 to max_discount
+     *   >80% outliers: Full max_discount
+     */
+    if (out_frac > RBPF_REAL(0.20))
+    {
+        rbpf_real_t intensity = (out_frac - RBPF_REAL(0.20)) / RBPF_REAL(0.60);
+        if (intensity > RBPF_REAL(1.0))
+            intensity = RBPF_REAL(1.0);
+        discount_struct = af->max_discount * intensity;
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * COMBINE: Take the STRONGER penalty
+     *
+     * MAX ensures we adapt if EITHER:
+     *   - Data fits poorly (drift) → discount_pred triggers
+     *   - Data fits only via outliers (shock) → discount_struct triggers
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    rbpf_real_t final_discount;
 
     switch (af->signal_source)
     {
     case ADAPT_SIGNAL_REGIME:
-        /* Pure regime baseline (no surprise modulation) */
-        lambda = af->lambda_per_regime[dominant_regime];
-        af->discount_applied = RBPF_REAL(0.0);
+        /* Pure regime baseline, no surprise modulation */
+        final_discount = RBPF_REAL(0.0);
         break;
 
     case ADAPT_SIGNAL_OUTLIER_FRAC:
+        /* Only structural (for testing) */
+        final_discount = discount_struct;
+        break;
+
     case ADAPT_SIGNAL_PREDICTIVE_SURPRISE:
-        /* Pure surprise-based (no regime baseline) */
-        {
-            rbpf_real_t base_lambda = RBPF_REAL(0.998); /* Fixed base */
-            rbpf_real_t discount = sigmoid_discount(af, af->signal_ema);
-            lambda = base_lambda * (RBPF_REAL(1.0) - discount);
-            af->discount_applied = discount;
-        }
+        /* Only predictive (for testing) */
+        final_discount = discount_pred;
         break;
 
     case ADAPT_SIGNAL_COMBINED:
     default:
-        /* RECOMMENDED: Regime baseline × surprise modifier */
-        {
-            rbpf_real_t base_lambda = af->lambda_per_regime[dominant_regime];
-            rbpf_real_t discount = sigmoid_discount(af, af->signal_ema);
-            lambda = base_lambda * (RBPF_REAL(1.0) - discount);
-            af->discount_applied = discount;
-        }
+        /* RECOMMENDED: Max of both paths */
+        final_discount = (discount_pred > discount_struct) ? discount_pred : discount_struct;
         break;
     }
 
+    af->discount_applied = final_discount;
+
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 5: Apply Cooldown
+     * COMPUTE LAMBDA
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    rbpf_real_t base_lambda = af->lambda_per_regime[dominant_regime];
+    rbpf_real_t lambda = base_lambda * (RBPF_REAL(1.0) - final_discount);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * COOLDOWN: Hold low λ after intervention
      *
-     * After intervention, hold low λ for a few ticks to allow adaptation.
-     * This prevents oscillation between high/low λ.
+     * Prevents oscillation between high/low λ.
      *═══════════════════════════════════════════════════════════════════════*/
 
     if (af->cooldown_remaining > 0)
@@ -346,7 +303,7 @@ void rbpf_adaptive_forgetting_update(
         lambda = af->lambda_current;
         af->cooldown_remaining--;
     }
-    else if (af->surprise_zscore > INTERVENTION_THRESHOLD)
+    else if (final_discount > RBPF_REAL(0.05) || af->surprise_zscore > INTERVENTION_THRESHOLD)
     {
         /* Start cooldown on significant intervention */
         af->cooldown_remaining = af->cooldown_ticks;
@@ -354,7 +311,7 @@ void rbpf_adaptive_forgetting_update(
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 6: Apply Bounds and Store Result
+     * BOUNDS AND OUTPUT
      *═══════════════════════════════════════════════════════════════════════*/
 
     if (lambda < af->lambda_floor)
@@ -365,9 +322,7 @@ void rbpf_adaptive_forgetting_update(
     af->lambda_current = lambda;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 7: Push to Storvik Parameter Learner
-     *
-     * The whole point: update the forgetting factor used by sufficient stats.
+     * PUSH TO STORVIK
      *═══════════════════════════════════════════════════════════════════════*/
 
     if (ext->storvik_initialized)

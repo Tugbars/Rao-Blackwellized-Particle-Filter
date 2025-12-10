@@ -571,7 +571,7 @@ typedef float rbpf_real_t;
         int apf_triggered; /* 1 if APF lookahead was used this step */
 
         /* Robust OCSN diagnostics */
-        rbpf_real_t outlier_fraction;  /* Posterior P(outlier | obs), 0 if robust OCSN disabled */
+        rbpf_real_t outlier_fraction; /* Weighted avg P(outlier | obs), [0,1] */
     } RBPF_KSC_Output;
 
     /*─────────────────────────────────────────────────────────────────────────────

@@ -117,6 +117,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_rbpf_scenarios PRIVATE ${COMMON_DEFS})
     endif()
 
+    # CSV output test for Jupyter visualization
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_csv.c)
+        add_executable(test_rbpf_csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_csv.c
+        )
+        target_link_libraries(test_rbpf_csv PRIVATE rbpf_ksc)
+        target_compile_options(test_rbpf_csv PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_rbpf_csv PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage

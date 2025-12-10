@@ -1,0 +1,10 @@
+phase_id,name,start_tick,end_tick,h_start,h_end,regime_start,regime_end,outlier_prob,is_gradual,description
+0,burn_in,0,500,-3.50,-3.50,1,1,0.00,0,"Stable burn-in period for filter convergence"
+1,outlier_stable,500,1000,-3.50,-3.50,1,1,0.05,0,"Stable vol with 5% outliers - filter should NOT chase"
+2,sudden_jump,1000,1500,-2.30,-2.30,2,2,0.00,0,"Sudden vol spike - filter should adapt quickly"
+3,high_vol_outliers,1500,2000,-2.30,-2.30,2,2,0.03,0,"Elevated vol with occasional outliers"
+4,gradual_decline,2000,3000,-2.30,-4.00,2,0,0.01,1,"Gradual vol decline - filter should follow smoothly"
+5,calm_stable,3000,3500,-4.00,-4.00,0,0,0.00,0,"Very calm market - filter should stay stable"
+6,outlier_burst,3500,3600,-4.00,-4.00,0,0,0.20,0,"CRITICAL: Outlier burst with NO real change - should NOT adapt"
+7,real_crash,3600,4000,-2.00,-2.00,3,3,0.08,0,"Real crash after outlier burst - should adapt despite noise"
+8,recovery,4000,5000,-2.00,-3.50,3,1,0.02,1,"Gradual recovery to normal"
