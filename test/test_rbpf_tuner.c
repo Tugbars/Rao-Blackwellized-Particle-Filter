@@ -480,7 +480,6 @@ int main(int argc, char *argv[])
     printf("================================================================\n");
 
     double t_start = get_time_ms();
-    float best_obj = tuner_grid_search(&tuner);
     double elapsed = get_time_ms() - t_start;
 
     printf("\nSearch completed in %.1f seconds\n", elapsed / 1000.0);
