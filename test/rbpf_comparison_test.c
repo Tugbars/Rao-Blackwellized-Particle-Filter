@@ -405,11 +405,12 @@ typedef struct
 
 typedef enum
 {
-    MODE_BASELINE = 0, /* RBPF, true params, no learning */
-    MODE_MISSPEC,      /* RBPF, wrong params, no learning */
-    MODE_LIU_WEST,     /* RBPF + Liu-West learning */
-    MODE_STORVIK,      /* RBPF + Storvik (no forgetting, no OCSN) */
-    MODE_STORVIK_FULL, /* RBPF + Storvik + Forgetting + Robust OCSN */
+    MODE_BASELINE = 0,   /* RBPF, true params, no learning */
+    MODE_MISSPEC,        /* RBPF, wrong params, no learning */
+    MODE_LIU_WEST,       /* RBPF + Liu-West learning */
+    MODE_STORVIK,        /* RBPF + Storvik (no forgetting, no OCSN) */
+    MODE_STORVIK_FORGET, /* RBPF + Storvik + Forgetting (no OCSN) */
+    MODE_STORVIK_FULL,   /* RBPF + Storvik + Forgetting + Robust OCSN */
     NUM_MODES
 } TestMode;
 
@@ -418,6 +419,7 @@ static const char *mode_names[] = {
     "Misspec",
     "Liu-West",
     "Storvik",
+    "Storvik+Fgt",
     "Storvik+Full"};
 
 static const char *csv_names[] = {
@@ -425,6 +427,7 @@ static const char *csv_names[] = {
     "rbpf_misspec.csv",
     "rbpf_liu_west.csv",
     "rbpf_storvik.csv",
+    "rbpf_storvik_forget.csv",
     "rbpf_storvik_full.csv"};
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -503,6 +506,28 @@ static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
         rbpf_ext_init(ext, TRUE_MU_VOL[0], 0.1f);
         break;
 
+    case MODE_STORVIK_FORGET:
+        /* Storvik + Adaptive Forgetting (no Robust OCSN) */
+        ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
+        for (int r = 0; r < N_REGIMES; r++)
+        {
+            rbpf_ext_set_regime_params(ext, r, TRUE_THETA[r], TRUE_MU_VOL[r], TRUE_SIGMA_VOL[r]);
+        }
+        rbpf_ext_build_transition_lut(ext, trans);
+
+        /* Enable regime-adaptive forgetting */
+        param_learn_set_forgetting(&ext->storvik, 1, 0.997f);        /* Default λ */
+        param_learn_set_regime_forgetting(&ext->storvik, 0, 0.999f); /* R0: slow (N_eff≈1000) */
+        param_learn_set_regime_forgetting(&ext->storvik, 1, 0.998f); /* R1 */
+        param_learn_set_regime_forgetting(&ext->storvik, 2, 0.996f); /* R2 */
+        param_learn_set_regime_forgetting(&ext->storvik, 3, 0.993f); /* R3: fast (N_eff≈143) */
+
+        /* Robust OCSN DISABLED */
+        ext->robust_ocsn.enabled = 0;
+
+        rbpf_ext_init(ext, TRUE_MU_VOL[0], 0.1f);
+        break;
+
     case MODE_STORVIK_FULL:
         /* Full stack: Storvik + Adaptive Forgetting + Robust OCSN */
         ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
@@ -556,6 +581,7 @@ static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
             break;
 
         case MODE_STORVIK:
+        case MODE_STORVIK_FORGET:
         case MODE_STORVIK_FULL:
             rbpf_ext_step(ext, ret, &output);
             break;
@@ -828,57 +854,68 @@ static void write_summary_csv(const char *filename, SummaryMetrics *metrics)
         return;
     }
 
-    fprintf(f, "metric,baseline,misspec,liu_west,storvik,storvik_full\n");
+    fprintf(f, "metric,baseline,misspec,liu_west,storvik,storvik_forget,storvik_full\n");
 
-    fprintf(f, "log_vol_rmse,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+    fprintf(f, "log_vol_rmse,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             metrics[0].log_vol_rmse, metrics[1].log_vol_rmse,
-            metrics[2].log_vol_rmse, metrics[3].log_vol_rmse, metrics[4].log_vol_rmse);
-    fprintf(f, "log_vol_mae,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            metrics[2].log_vol_rmse, metrics[3].log_vol_rmse,
+            metrics[4].log_vol_rmse, metrics[5].log_vol_rmse);
+    fprintf(f, "log_vol_mae,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             metrics[0].log_vol_mae, metrics[1].log_vol_mae,
-            metrics[2].log_vol_mae, metrics[3].log_vol_mae, metrics[4].log_vol_mae);
-    fprintf(f, "vol_rmse,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            metrics[2].log_vol_mae, metrics[3].log_vol_mae,
+            metrics[4].log_vol_mae, metrics[5].log_vol_mae);
+    fprintf(f, "vol_rmse,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             metrics[0].vol_rmse, metrics[1].vol_rmse,
-            metrics[2].vol_rmse, metrics[3].vol_rmse, metrics[4].vol_rmse);
-    fprintf(f, "regime_accuracy,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[2].vol_rmse, metrics[3].vol_rmse,
+            metrics[4].vol_rmse, metrics[5].vol_rmse);
+    fprintf(f, "regime_accuracy,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].regime_accuracy, metrics[1].regime_accuracy,
-            metrics[2].regime_accuracy, metrics[3].regime_accuracy, metrics[4].regime_accuracy);
-    fprintf(f, "avg_ess,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+            metrics[2].regime_accuracy, metrics[3].regime_accuracy,
+            metrics[4].regime_accuracy, metrics[5].regime_accuracy);
+    fprintf(f, "avg_ess,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
             metrics[0].avg_ess, metrics[1].avg_ess,
-            metrics[2].avg_ess, metrics[3].avg_ess, metrics[4].avg_ess);
-    fprintf(f, "min_ess,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+            metrics[2].avg_ess, metrics[3].avg_ess,
+            metrics[4].avg_ess, metrics[5].avg_ess);
+    fprintf(f, "min_ess,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
             metrics[0].min_ess, metrics[1].min_ess,
-            metrics[2].min_ess, metrics[3].min_ess, metrics[4].min_ess);
-    fprintf(f, "ess_collapse_count,%d,%d,%d,%d,%d\n",
+            metrics[2].min_ess, metrics[3].min_ess,
+            metrics[4].min_ess, metrics[5].min_ess);
+    fprintf(f, "ess_collapse_count,%d,%d,%d,%d,%d,%d\n",
             metrics[0].ess_collapse_count, metrics[1].ess_collapse_count,
-            metrics[2].ess_collapse_count, metrics[3].ess_collapse_count, metrics[4].ess_collapse_count);
-    fprintf(f, "avg_latency_us,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+            metrics[2].ess_collapse_count, metrics[3].ess_collapse_count,
+            metrics[4].ess_collapse_count, metrics[5].ess_collapse_count);
+    fprintf(f, "avg_latency_us,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
             metrics[0].avg_latency_us, metrics[1].avg_latency_us,
-            metrics[2].avg_latency_us, metrics[3].avg_latency_us, metrics[4].avg_latency_us);
-    fprintf(f, "p99_latency_us,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+            metrics[2].avg_latency_us, metrics[3].avg_latency_us,
+            metrics[4].avg_latency_us, metrics[5].avg_latency_us);
+    fprintf(f, "p99_latency_us,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
             metrics[0].p99_latency_us, metrics[1].p99_latency_us,
-            metrics[2].p99_latency_us, metrics[3].p99_latency_us, metrics[4].p99_latency_us);
-    fprintf(f, "mu_vol_r0_error,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[2].p99_latency_us, metrics[3].p99_latency_us,
+            metrics[4].p99_latency_us, metrics[5].p99_latency_us);
+    fprintf(f, "mu_vol_r0_error,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].mu_vol_error[0], metrics[1].mu_vol_error[0],
-            metrics[2].mu_vol_error[0], metrics[3].mu_vol_error[0], metrics[4].mu_vol_error[0]);
-    fprintf(f, "mu_vol_r3_error,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[2].mu_vol_error[0], metrics[3].mu_vol_error[0],
+            metrics[4].mu_vol_error[0], metrics[5].mu_vol_error[0]);
+    fprintf(f, "mu_vol_r3_error,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].mu_vol_error[3], metrics[1].mu_vol_error[3],
-            metrics[2].mu_vol_error[3], metrics[3].mu_vol_error[3], metrics[4].mu_vol_error[3]);
-    fprintf(f, "log_vol_rmse_on_outliers,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[2].mu_vol_error[3], metrics[3].mu_vol_error[3],
+            metrics[4].mu_vol_error[3], metrics[5].mu_vol_error[3]);
+    fprintf(f, "log_vol_rmse_on_outliers,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].log_vol_rmse_on_outliers, metrics[1].log_vol_rmse_on_outliers,
             metrics[2].log_vol_rmse_on_outliers, metrics[3].log_vol_rmse_on_outliers,
-            metrics[4].log_vol_rmse_on_outliers);
-    fprintf(f, "log_vol_rmse_on_normal,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[4].log_vol_rmse_on_outliers, metrics[5].log_vol_rmse_on_outliers);
+    fprintf(f, "log_vol_rmse_on_normal,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].log_vol_rmse_on_normal, metrics[1].log_vol_rmse_on_normal,
             metrics[2].log_vol_rmse_on_normal, metrics[3].log_vol_rmse_on_normal,
-            metrics[4].log_vol_rmse_on_normal);
-    fprintf(f, "avg_outlier_frac_on_outliers,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            metrics[4].log_vol_rmse_on_normal, metrics[5].log_vol_rmse_on_normal);
+    fprintf(f, "avg_outlier_frac_on_outliers,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
             metrics[0].avg_outlier_fraction_on_outliers, metrics[1].avg_outlier_fraction_on_outliers,
             metrics[2].avg_outlier_fraction_on_outliers, metrics[3].avg_outlier_fraction_on_outliers,
-            metrics[4].avg_outlier_fraction_on_outliers);
-    fprintf(f, "outlier_detection_count,%d,%d,%d,%d,%d\n",
+            metrics[4].avg_outlier_fraction_on_outliers, metrics[5].avg_outlier_fraction_on_outliers);
+    fprintf(f, "outlier_detection_count,%d,%d,%d,%d,%d,%d\n",
             metrics[0].outlier_detection_count, metrics[1].outlier_detection_count,
             metrics[2].outlier_detection_count, metrics[3].outlier_detection_count,
-            metrics[4].outlier_detection_count);
+            metrics[4].outlier_detection_count, metrics[5].outlier_detection_count);
 
     fclose(f);
     printf("  Written: %s\n", filename);
@@ -894,82 +931,90 @@ static void print_summary_table(SummaryMetrics *metrics, SyntheticData *data,
     int n = data->n_ticks;
 
     printf("\n");
-    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
     printf("  SUMMARY COMPARISON (N=512 particles, %d ticks, %d injected outliers)\n",
            n, data->n_outliers_injected);
-    printf("════════════════════════════════════════════════════════════════════════════════\n");
-    printf("%-24s %10s %10s %10s %10s %12s\n",
-           "Metric", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+Full");
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("%-24s %10s %10s %10s %10s %12s %12s\n",
+           "Metric", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+Fgt", "Storvik+Full");
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
     /* State estimation */
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "Log-Vol RMSE",
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "Log-Vol RMSE",
            metrics[0].log_vol_rmse, metrics[1].log_vol_rmse,
-           metrics[2].log_vol_rmse, metrics[3].log_vol_rmse, metrics[4].log_vol_rmse);
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "Vol RMSE",
+           metrics[2].log_vol_rmse, metrics[3].log_vol_rmse,
+           metrics[4].log_vol_rmse, metrics[5].log_vol_rmse);
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "Vol RMSE",
            metrics[0].vol_rmse, metrics[1].vol_rmse,
-           metrics[2].vol_rmse, metrics[3].vol_rmse, metrics[4].vol_rmse);
+           metrics[2].vol_rmse, metrics[3].vol_rmse,
+           metrics[4].vol_rmse, metrics[5].vol_rmse);
 
     /* Regime accuracy */
-    printf("%-24s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%%\n", "Regime Accuracy",
+    printf("%-24s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%% %11.1f%%\n", "Regime Accuracy",
            100 * metrics[0].regime_accuracy, 100 * metrics[1].regime_accuracy,
            100 * metrics[2].regime_accuracy, 100 * metrics[3].regime_accuracy,
-           100 * metrics[4].regime_accuracy);
+           100 * metrics[4].regime_accuracy, 100 * metrics[5].regime_accuracy);
 
     /* ESS health */
-    printf("%-24s %10.1f %10.1f %10.1f %10.1f %12.1f\n", "Avg ESS",
+    printf("%-24s %10.1f %10.1f %10.1f %10.1f %12.1f %12.1f\n", "Avg ESS",
            metrics[0].avg_ess, metrics[1].avg_ess,
-           metrics[2].avg_ess, metrics[3].avg_ess, metrics[4].avg_ess);
-    printf("%-24s %10.1f %10.1f %10.1f %10.1f %12.1f\n", "Min ESS",
+           metrics[2].avg_ess, metrics[3].avg_ess,
+           metrics[4].avg_ess, metrics[5].avg_ess);
+    printf("%-24s %10.1f %10.1f %10.1f %10.1f %12.1f %12.1f\n", "Min ESS",
            metrics[0].min_ess, metrics[1].min_ess,
-           metrics[2].min_ess, metrics[3].min_ess, metrics[4].min_ess);
-    printf("%-24s %10d %10d %10d %10d %12d\n", "ESS Collapse Count",
+           metrics[2].min_ess, metrics[3].min_ess,
+           metrics[4].min_ess, metrics[5].min_ess);
+    printf("%-24s %10d %10d %10d %10d %12d %12d\n", "ESS Collapse Count",
            metrics[0].ess_collapse_count, metrics[1].ess_collapse_count,
            metrics[2].ess_collapse_count, metrics[3].ess_collapse_count,
-           metrics[4].ess_collapse_count);
+           metrics[4].ess_collapse_count, metrics[5].ess_collapse_count);
 
     /* Timing */
-    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f\n", "Avg Latency (us)",
+    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f %12.2f\n", "Avg Latency (us)",
            metrics[0].avg_latency_us, metrics[1].avg_latency_us,
-           metrics[2].avg_latency_us, metrics[3].avg_latency_us, metrics[4].avg_latency_us);
-    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f\n", "P99 Latency (us)",
+           metrics[2].avg_latency_us, metrics[3].avg_latency_us,
+           metrics[4].avg_latency_us, metrics[5].avg_latency_us);
+    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f %12.2f\n", "P99 Latency (us)",
            metrics[0].p99_latency_us, metrics[1].p99_latency_us,
-           metrics[2].p99_latency_us, metrics[3].p99_latency_us, metrics[4].p99_latency_us);
+           metrics[2].p99_latency_us, metrics[3].p99_latency_us,
+           metrics[4].p99_latency_us, metrics[5].p99_latency_us);
 
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
     printf("PARAMETER LEARNING (Error vs Truth at End)\n");
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "mu_vol R0 Error",
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "mu_vol R0 Error",
            metrics[0].mu_vol_error[0], metrics[1].mu_vol_error[0],
-           metrics[2].mu_vol_error[0], metrics[3].mu_vol_error[0], metrics[4].mu_vol_error[0]);
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "mu_vol R3 Error",
+           metrics[2].mu_vol_error[0], metrics[3].mu_vol_error[0],
+           metrics[4].mu_vol_error[0], metrics[5].mu_vol_error[0]);
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "mu_vol R3 Error",
            metrics[0].mu_vol_error[3], metrics[1].mu_vol_error[3],
-           metrics[2].mu_vol_error[3], metrics[3].mu_vol_error[3], metrics[4].mu_vol_error[3]);
+           metrics[2].mu_vol_error[3], metrics[3].mu_vol_error[3],
+           metrics[4].mu_vol_error[3], metrics[5].mu_vol_error[3]);
 
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
     printf("OUTLIER ROBUSTNESS (%d injected outliers, 6-15σ)\n", data->n_outliers_injected);
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "RMSE on Outlier Ticks",
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "RMSE on Outlier Ticks",
            metrics[0].log_vol_rmse_on_outliers, metrics[1].log_vol_rmse_on_outliers,
            metrics[2].log_vol_rmse_on_outliers, metrics[3].log_vol_rmse_on_outliers,
-           metrics[4].log_vol_rmse_on_outliers);
-    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f\n", "RMSE on Normal Ticks",
+           metrics[4].log_vol_rmse_on_outliers, metrics[5].log_vol_rmse_on_outliers);
+    printf("%-24s %10.4f %10.4f %10.4f %10.4f %12.4f %12.4f\n", "RMSE on Normal Ticks",
            metrics[0].log_vol_rmse_on_normal, metrics[1].log_vol_rmse_on_normal,
            metrics[2].log_vol_rmse_on_normal, metrics[3].log_vol_rmse_on_normal,
-           metrics[4].log_vol_rmse_on_normal);
-    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f\n", "Avg Outlier Frac (outliers)",
+           metrics[4].log_vol_rmse_on_normal, metrics[5].log_vol_rmse_on_normal);
+    printf("%-24s %10.2f %10.2f %10.2f %10.2f %12.2f %12.2f\n", "Avg Outlier Frac (outliers)",
            metrics[0].avg_outlier_fraction_on_outliers, metrics[1].avg_outlier_fraction_on_outliers,
            metrics[2].avg_outlier_fraction_on_outliers, metrics[3].avg_outlier_fraction_on_outliers,
-           metrics[4].avg_outlier_fraction_on_outliers);
-    printf("%-24s %10d %10d %10d %10d %12d\n", "Outlier Detections",
+           metrics[4].avg_outlier_fraction_on_outliers, metrics[5].avg_outlier_fraction_on_outliers);
+    printf("%-24s %10d %10d %10d %10d %12d %12d\n", "Outlier Detections",
            metrics[0].outlier_detection_count, metrics[1].outlier_detection_count,
            metrics[2].outlier_detection_count, metrics[3].outlier_detection_count,
-           metrics[4].outlier_detection_count);
-    printf("════════════════════════════════════════════════════════════════════════════════\n");
+           metrics[4].outlier_detection_count, metrics[5].outlier_detection_count);
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
 
     /* Scenario breakdown */
     printf("\nSCENARIO BREAKDOWN (Regime Accuracy %%)\n");
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
     const char *scenario_names[] = {
         "1. Calm + 2 outliers",
@@ -980,9 +1025,9 @@ static void print_summary_table(SummaryMetrics *metrics, SyntheticData *data,
         "6. Flash Crash + 12σ",
         "7. Choppy"};
 
-    printf("%-24s %10s %10s %10s %10s %12s\n",
-           "Scenario", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+Full");
-    printf("────────────────────────────────────────────────────────────────────────────────\n");
+    printf("%-24s %10s %10s %10s %10s %12s %12s\n",
+           "Scenario", "Baseline", "Misspec", "Liu-West", "Storvik", "Storvik+Fgt", "Storvik+Full");
+    printf("──────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
     for (int s = 0; s < data->n_scenarios; s++)
     {
@@ -1000,14 +1045,15 @@ static void print_summary_table(SummaryMetrics *metrics, SyntheticData *data,
             }
         }
 
-        printf("%-24s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%%\n", scenario_names[s],
+        printf("%-24s %9.1f%% %9.1f%% %9.1f%% %9.1f%% %11.1f%% %11.1f%%\n", scenario_names[s],
                100.0 * correct[0] / count,
                100.0 * correct[1] / count,
                100.0 * correct[2] / count,
                100.0 * correct[3] / count,
-               100.0 * correct[4] / count);
+               100.0 * correct[4] / count,
+               100.0 * correct[5] / count);
     }
-    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
 }
 
 /*─────────────────────────────────────────────────────────────────────────────

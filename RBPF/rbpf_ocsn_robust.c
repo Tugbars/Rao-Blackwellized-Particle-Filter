@@ -9,9 +9,13 @@
  * Standard OCSN (Omori et al., 2007) uses 10-component mixture to approximate
  * log(χ²₁) for the observation equation:
  *
- *   y_t = exp(h_t/2) * ε_t,  ε_t ~ N(0,1)
- *   log(y_t²) = h_t + log(ε_t²)
- *             = h_t + ξ_t,   ξ_t ~ log(χ²₁)
+ *   r_t = exp(h_t/2) * ε_t,  ε_t ~ N(0,1)
+ *   y_t = log(r_t²) = h_t + log(ε_t²)
+ *
+ * In the KSC parameterization used by rbpf_ksc.c, we store ℓ = h/2, so:
+ *   y_t = 2*ℓ_t + log(ε_t²)
+ *
+ * This gives observation equation: y = H*ℓ + ξ, where H=2 and ξ ~ log(χ²₁)
  *
  * The 10-component mixture works well for normal returns (|ε| < 4σ), but
  * fat-tail events (8-15σ) cause particle collapse because:
@@ -22,44 +26,20 @@
  * ROBUST OCSN adds an 11th "outlier" component:
  *
  *   P(obs | h, regime) = (1 - π_out) × P_OCSN(obs | h)
- *                      + π_out × N(obs | h, σ²_out)
- *
- * Where:
- *   π_out    = outlier probability (regime-dependent, typically 1-2.5%)
- *   σ²_out   = outlier variance (regime-dependent, typically 18-30)
- *
- * The outlier component is a broad Gaussian that provides "support" during
- * extreme moves, preventing complete particle collapse.
+ *                      + π_out × N(obs | H*h, H²*P + σ²_out)
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * VARIANCE BOUNDS (Critical for Signal Preservation)
+ * CRITICAL: H = 2 OBSERVATION MATRIX
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Max OCSN variance = 7.33 (component 10)
+ * The observation equation y = H*h + ξ has H=2, NOT H=1!
  *
- * If outlier variance too LOW (<15):
- *   - Outlier component competes with OCSN on normal observations
- *   - Distorts Kalman updates, biases state estimates
- *
- * If outlier variance too HIGH (>50):
- *   - Kalman gain K → 0 during outliers
- *   - Filter ignores extreme moves entirely ("signal suppression")
- *   - Defeats purpose of robust handling
- *
- * Sweet spot: 2-4× max OCSN variance ≈ 15-30
- *   - R0 (calm):   var=18, prob=1.0%   (rare outliers, modest variance)
- *   - R1:          var=22, prob=1.5%
- *   - R2:          var=26, prob=2.0%
- *   - R3 (crisis): var=30, prob=2.5%   (more outliers, wider variance)
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * IMPLEMENTATION NOTES
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * 1. Likelihood computation uses log-sum-exp for numerical stability
- * 2. Kalman update blends OCSN and outlier posteriors by mixture weight
- * 3. outlier_fraction output enables monitoring and diagnostics
- * 4. Per-regime parameters allow crisis-adaptive robustness
+ * This affects ALL Kalman calculations:
+ *   - Innovation mean:     y - H*h - m_k = y - 2*h - m_k
+ *   - Innovation variance: H²*P + v_k = 4*P + v_k
+ *   - Kalman gain:         K = H*P / S = 2*P / S
+ *   - State update:        h_post = h_prior + K * innovation
+ *   - Variance update:     P_post = (1 - K*H) * P = (1 - 2*K) * P
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -69,7 +49,14 @@
 #include <float.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
- * OCSN MIXTURE PARAMETERS (Kim, Shephard, Chib 1998)
+ * OBSERVATION EQUATION CONSTANTS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#define H_OBS RBPF_REAL(2.0)  /* Observation matrix: y = H*h + noise */
+#define H2_OBS RBPF_REAL(4.0) /* H² for variance calculations */
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * OCSN MIXTURE PARAMETERS (Kim, Shephard, Chib 1998 / Omori 2007)
  *
  * 10-component mixture approximation to log(χ²₁)
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -86,8 +73,13 @@ static const rbpf_real_t OCSN_VAR[10] = {
     0.11265f, 0.17788f, 0.26768f, 0.40611f, 0.62699f,
     0.98583f, 1.57469f, 2.54498f, 4.16591f, 7.33342f};
 
-/* Precomputed log(2π) for Gaussian PDF */
-#define LOG_2PI 1.8378770664093453f
+/* Precomputed: log(π_k) for each component */
+static const rbpf_real_t OCSN_LOG_PROB[10] = {
+    -5.101f, -3.042f, -2.036f, -1.577f, -1.482f,
+    -1.669f, -2.116f, -2.884f, -4.151f, -6.768f};
+
+/* Precomputed: -0.5 * log(2π) */
+#define LOG_2PI_HALF RBPF_REAL(-0.9189385332)
 
 /*═══════════════════════════════════════════════════════════════════════════
  * HELPER: Log-Sum-Exp for numerical stability
@@ -106,145 +98,13 @@ static inline rbpf_real_t log_sum_exp_2(rbpf_real_t log_a, rbpf_real_t log_b)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * HELPER: Gaussian log-PDF
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static inline rbpf_real_t gaussian_log_pdf(rbpf_real_t x, rbpf_real_t mean, rbpf_real_t var)
-{
-    rbpf_real_t diff = x - mean;
-    return -0.5f * (LOG_2PI + rbpf_log(var) + diff * diff / var);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * COMPUTE OCSN LOG-LIKELIHOOD (standard 10-component)
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static rbpf_real_t compute_ocsn_log_likelihood(rbpf_real_t obs, rbpf_real_t h)
-{
-    /* obs = log(y²), expected = h under each mixture component */
-    rbpf_real_t max_log_lik = -1e30f;
-    rbpf_real_t log_liks[10];
-
-    /* Compute log-likelihood under each component */
-    for (int k = 0; k < 10; k++)
-    {
-        /* Component k: obs ~ N(h + m_k, v_k) */
-        rbpf_real_t mean_k = h + OCSN_MEAN[k];
-        rbpf_real_t var_k = OCSN_VAR[k];
-        rbpf_real_t log_prob_k = rbpf_log(OCSN_PROB[k]);
-
-        log_liks[k] = log_prob_k + gaussian_log_pdf(obs, mean_k, var_k);
-
-        if (log_liks[k] > max_log_lik)
-            max_log_lik = log_liks[k];
-    }
-
-    /* Log-sum-exp for numerical stability */
-    rbpf_real_t sum = 0.0f;
-    for (int k = 0; k < 10; k++)
-    {
-        sum += rbpf_exp(log_liks[k] - max_log_lik);
-    }
-
-    return max_log_lik + rbpf_log(sum);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * COMPUTE OCSN KALMAN UPDATE (standard - used for blending)
- *
- * Returns posterior mean and variance after OCSN update
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static void compute_ocsn_kalman_update(
-    rbpf_real_t obs,
-    rbpf_real_t h_prior,
-    rbpf_real_t P_prior,
-    rbpf_real_t *h_post,
-    rbpf_real_t *P_post)
-{
-    /* Mixture-weighted Kalman update
-     * Weight each component by its posterior probability */
-
-    rbpf_real_t log_weights[10];
-    rbpf_real_t max_log_w = -1e30f;
-
-    /* Compute posterior weights for each component */
-    for (int k = 0; k < 10; k++)
-    {
-        rbpf_real_t mean_k = h_prior + OCSN_MEAN[k];
-        rbpf_real_t var_k = OCSN_VAR[k];
-        rbpf_real_t log_prob_k = rbpf_log(OCSN_PROB[k]);
-
-        log_weights[k] = log_prob_k + gaussian_log_pdf(obs, mean_k, var_k);
-
-        if (log_weights[k] > max_log_w)
-            max_log_w = log_weights[k];
-    }
-
-    /* Normalize weights */
-    rbpf_real_t weights[10];
-    rbpf_real_t sum_w = 0.0f;
-    for (int k = 0; k < 10; k++)
-    {
-        weights[k] = rbpf_exp(log_weights[k] - max_log_w);
-        sum_w += weights[k];
-    }
-    for (int k = 0; k < 10; k++)
-    {
-        weights[k] /= sum_w;
-    }
-
-    /* Compute weighted posterior mean and variance */
-    rbpf_real_t h_sum = 0.0f;
-    rbpf_real_t P_sum = 0.0f;
-
-    for (int k = 0; k < 10; k++)
-    {
-        rbpf_real_t var_k = OCSN_VAR[k];
-
-        /* Kalman gain for component k */
-        rbpf_real_t S_k = P_prior + var_k; /* Innovation variance */
-        rbpf_real_t K_k = P_prior / S_k;   /* Kalman gain */
-
-        /* Innovation */
-        rbpf_real_t innovation = obs - (h_prior + OCSN_MEAN[k]);
-
-        /* Posterior for component k */
-        rbpf_real_t h_k = h_prior + K_k * innovation;
-        rbpf_real_t P_k = P_prior * (1.0f - K_k);
-
-        /* Accumulate weighted by posterior probability */
-        h_sum += weights[k] * h_k;
-        P_sum += weights[k] * (P_k + (h_k - h_sum) * (h_k - h_sum));
-    }
-
-    /* Recompute variance with correct mean */
-    P_sum = 0.0f;
-    for (int k = 0; k < 10; k++)
-    {
-        rbpf_real_t var_k = OCSN_VAR[k];
-        rbpf_real_t S_k = P_prior + var_k;
-        rbpf_real_t K_k = P_prior / S_k;
-        rbpf_real_t innovation = obs - (h_prior + OCSN_MEAN[k]);
-        rbpf_real_t h_k = h_prior + K_k * innovation;
-        rbpf_real_t P_k = P_prior * (1.0f - K_k);
-
-        /* Variance = E[P] + E[(h - E[h])²] */
-        P_sum += weights[k] * (P_k + (h_k - h_sum) * (h_k - h_sum));
-    }
-
-    *h_post = h_sum;
-    *P_post = P_sum;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
  * rbpf_ksc_update_robust
  *
  * Performs RBPF update with 11-component Robust OCSN likelihood.
- * Blends standard OCSN with broad outlier component.
+ * Matches rbpf_ksc_update() exactly, but adds outlier component.
  *
  * @param rbpf          RBPF filter state
- * @param y             Transformed observation: y = log(r²) where r is raw return
+ * @param y             Transformed observation: y = log(r²)
  * @param robust_ocsn   Robust OCSN configuration (per-regime outlier params)
  * @return              Weighted average log-likelihood
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -256,130 +116,169 @@ rbpf_real_t rbpf_ksc_update_robust(
 {
     if (!rbpf || !robust_ocsn || !robust_ocsn->enabled)
     {
-        /* Fall back to standard update if robust not enabled */
         return rbpf_ksc_update(rbpf, y);
     }
 
     const int n = rbpf->n_particles;
+    const rbpf_real_t NEG_HALF = RBPF_REAL(-0.5);
 
-    /* y is ALREADY transformed: y = log(r²) where r is the raw return
-     * This matches rbpf_ksc_update() convention */
-    rbpf_real_t obs = y;
-
-    rbpf_real_t max_log_w = -1e30f;
-
-    /* Use predicted state (from rbpf_ksc_predict) as prior */
     rbpf_real_t *restrict mu_pred = rbpf->mu_pred;
     rbpf_real_t *restrict var_pred = rbpf->var_pred;
     rbpf_real_t *restrict mu = rbpf->mu;
     rbpf_real_t *restrict var = rbpf->var;
     rbpf_real_t *restrict log_weight = rbpf->log_weight;
+    const int *restrict regime = rbpf->regime;
 
-    /* Update each particle */
+    /* Temporary storage for log-likelihoods (for log-sum-exp) */
+    rbpf_real_t log_liks[11]; /* 10 OCSN + 1 outlier */
+
+    /* Accumulator for marginal likelihood */
+    rbpf_real_t total_marginal = RBPF_REAL(0.0);
+
     for (int i = 0; i < n; i++)
     {
-        int regime = rbpf->regime[i];
-        rbpf_real_t h_prior = mu_pred[i];  /* Use PREDICTED state as prior */
-        rbpf_real_t P_prior = var_pred[i]; /* Use PREDICTED variance as prior */
+        int r = regime[i];
+        rbpf_real_t h_prior = mu_pred[i];
+        rbpf_real_t P_prior = var_pred[i];
 
-        /* Get regime-specific outlier parameters */
-        rbpf_real_t pi_out = robust_ocsn->regime[regime].prob;
-        rbpf_real_t var_out = robust_ocsn->regime[regime].variance;
+        /* Get outlier parameters for this regime */
+        rbpf_real_t pi_out = robust_ocsn->regime[r].prob;
+        rbpf_real_t var_out = robust_ocsn->regime[r].variance;
 
-        /* Clamp variance to safe bounds */
+        /* Clamp outlier variance to safe bounds */
         if (var_out < RBPF_OUTLIER_VAR_MIN)
             var_out = RBPF_OUTLIER_VAR_MIN;
         if (var_out > RBPF_OUTLIER_VAR_MAX)
             var_out = RBPF_OUTLIER_VAR_MAX;
 
-        /*───────────────────────────────────────────────────────────────────
-         * Compute log-likelihoods
-         *─────────────────────────────────────────────────────────────────*/
-
-        /* Standard OCSN log-likelihood */
-        rbpf_real_t log_lik_ocsn = compute_ocsn_log_likelihood(obs, h_prior);
-
-        /* Outlier component log-likelihood: obs ~ N(h, var_out) */
-        rbpf_real_t log_lik_out = gaussian_log_pdf(obs, h_prior, var_out);
-
-        /* Combined log-likelihood (log-sum-exp) */
         rbpf_real_t log_1_minus_pi = rbpf_log(1.0f - pi_out);
         rbpf_real_t log_pi = rbpf_log(pi_out);
 
-        rbpf_real_t log_lik_combined = log_sum_exp_2(
-            log_1_minus_pi + log_lik_ocsn,
-            log_pi + log_lik_out);
-
         /*───────────────────────────────────────────────────────────────────
-         * Compute posterior outlier probability
-         *─────────────────────────────────────────────────────────────────*/
-
-        /* P(outlier | obs) = π × P(obs|outlier) / P(obs) */
-        rbpf_real_t log_post_out = log_pi + log_lik_out - log_lik_combined;
-        rbpf_real_t post_out = rbpf_exp(log_post_out);
-
-        /* Clamp to [0, 1] */
-        if (post_out < 0.0f)
-            post_out = 0.0f;
-        if (post_out > 1.0f)
-            post_out = 1.0f;
-
-        /*───────────────────────────────────────────────────────────────────
-         * Blended Kalman update
+         * Pass 1: Compute log-likelihoods for all 11 components
          *
-         * h_post = (1 - post_out) × h_ocsn + post_out × h_outlier
-         * P_post = blended variance (more complex)
+         * OCSN components k=0..9:
+         *   y ~ N(H*h + m_k, H²*P + v_k)  with H=2
+         *
+         * Outlier component k=10:
+         *   y ~ N(H*h, H²*P + var_out)
          *─────────────────────────────────────────────────────────────────*/
 
-        /* OCSN posterior */
-        rbpf_real_t h_ocsn, P_ocsn;
-        compute_ocsn_kalman_update(obs, h_prior, P_prior, &h_ocsn, &P_ocsn);
+        rbpf_real_t max_log_lik = RBPF_REAL(-1e30);
 
-        /* Outlier posterior (simple Kalman with broad variance) */
-        rbpf_real_t S_out = P_prior + var_out;
-        rbpf_real_t K_out = P_prior / S_out;
-        rbpf_real_t innovation_out = obs - h_prior;
-        rbpf_real_t h_out = h_prior + K_out * innovation_out;
-        rbpf_real_t P_out = P_prior * (1.0f - K_out);
+        /* 10 OCSN components */
+        for (int k = 0; k < 10; k++)
+        {
+            rbpf_real_t y_adj = y - OCSN_MEAN[k];
+            rbpf_real_t innov = y_adj - H_OBS * h_prior;
+            rbpf_real_t S = H2_OBS * P_prior + OCSN_VAR[k];
+            rbpf_real_t innov2_S = innov * innov / S;
 
-        /* Blend posteriors */
-        rbpf_real_t w_ocsn = 1.0f - post_out;
-        rbpf_real_t w_out = post_out;
+            /* log N(y | H*h + m_k, S) + log(π_k) + log(1 - π_out) */
+            log_liks[k] = log_1_minus_pi + OCSN_LOG_PROB[k] +
+                          NEG_HALF * (rbpf_log(S) + innov2_S);
 
-        rbpf_real_t h_post = w_ocsn * h_ocsn + w_out * h_out;
+            if (log_liks[k] > max_log_lik)
+                max_log_lik = log_liks[k];
+        }
 
-        /* Blended variance = E[P] + E[(h - E[h])²] */
-        rbpf_real_t P_post = w_ocsn * P_ocsn + w_out * P_out + w_ocsn * (h_ocsn - h_post) * (h_ocsn - h_post) + w_out * (h_out - h_post) * (h_out - h_post);
+        /* Outlier component */
+        {
+            rbpf_real_t innov = y - H_OBS * h_prior;
+            rbpf_real_t S = H2_OBS * P_prior + var_out;
+            rbpf_real_t innov2_S = innov * innov / S;
 
-        /* Store updated state */
+            /* log N(y | H*h, S) + log(π_out) */
+            log_liks[10] = log_pi + NEG_HALF * (rbpf_log(S) + innov2_S);
+
+            if (log_liks[10] > max_log_lik)
+                max_log_lik = log_liks[10];
+        }
+
+        /*───────────────────────────────────────────────────────────────────
+         * Pass 2: Normalize and compute weighted Kalman update
+         *
+         * Total likelihood = sum of all 11 component likelihoods
+         * Each component contributes:
+         *   - Likelihood weight w_k
+         *   - Posterior mean h_k
+         *   - Posterior variance P_k
+         *
+         * Final posterior uses law of total variance:
+         *   E[h] = Σ w_k * h_k
+         *   E[h²] = Σ w_k * (P_k + h_k²)
+         *   Var[h] = E[h²] - E[h]²
+         *─────────────────────────────────────────────────────────────────*/
+
+        rbpf_real_t lik_total = RBPF_REAL(0.0);
+        rbpf_real_t h_accum = RBPF_REAL(0.0);
+        rbpf_real_t h2_accum = RBPF_REAL(0.0); /* E[h²] = Σ w_k (P_k + h_k²) */
+
+        /* 10 OCSN components */
+        for (int k = 0; k < 10; k++)
+        {
+            rbpf_real_t lik = rbpf_exp(log_liks[k] - max_log_lik);
+
+            /* Kalman update for component k */
+            rbpf_real_t y_adj = y - OCSN_MEAN[k];
+            rbpf_real_t innov = y_adj - H_OBS * h_prior;
+            rbpf_real_t S = H2_OBS * P_prior + OCSN_VAR[k];
+            rbpf_real_t K = H_OBS * P_prior / S;
+
+            rbpf_real_t h_k = h_prior + K * innov;
+            rbpf_real_t P_k = (RBPF_REAL(1.0) - K * H_OBS) * P_prior;
+
+            lik_total += lik;
+            h_accum += lik * h_k;
+            h2_accum += lik * (P_k + h_k * h_k);
+        }
+
+        /* Outlier component */
+        {
+            rbpf_real_t lik = rbpf_exp(log_liks[10] - max_log_lik);
+
+            /* Kalman update for outlier component */
+            rbpf_real_t innov = y - H_OBS * h_prior;
+            rbpf_real_t S = H2_OBS * P_prior + var_out;
+            rbpf_real_t K = H_OBS * P_prior / S;
+
+            rbpf_real_t h_out = h_prior + K * innov;
+            rbpf_real_t P_out = (RBPF_REAL(1.0) - K * H_OBS) * P_prior;
+
+            lik_total += lik;
+            h_accum += lik * h_out;
+            h2_accum += lik * (P_out + h_out * h_out);
+        }
+
+        /*───────────────────────────────────────────────────────────────────
+         * Finalize posterior
+         *─────────────────────────────────────────────────────────────────*/
+
+        rbpf_real_t inv_lik = RBPF_REAL(1.0) / (lik_total + RBPF_REAL(1e-30));
+        rbpf_real_t h_post = h_accum * inv_lik;
+        rbpf_real_t E_h2 = h2_accum * inv_lik;
+        rbpf_real_t P_post = E_h2 - h_post * h_post;
+
+        /* Floor variance */
+        if (P_post < RBPF_REAL(1e-6))
+            P_post = RBPF_REAL(1e-6);
+
+        /* Store posterior */
         mu[i] = h_post;
         var[i] = P_post;
 
-        /* Update log-weight */
-        log_weight[i] += log_lik_combined;
+        /* Update log-weight: log(sum * exp(max)) = log(sum) + max */
+        log_weight[i] += rbpf_log(lik_total + RBPF_REAL(1e-30)) + max_log_lik;
 
-        if (log_weight[i] > max_log_w)
-            max_log_w = log_weight[i];
+        /* Accumulate marginal likelihood: lik_total * exp(max_log_lik) */
+        total_marginal += lik_total * rbpf_exp(max_log_lik);
     }
 
-    /* Normalize weights (log-sum-exp) */
-    rbpf_real_t sum_w = 0.0f;
-    for (int i = 0; i < n; i++)
-    {
-        rbpf->w_norm[i] = rbpf_exp(rbpf->log_weight[i] - max_log_w);
-        sum_w += rbpf->w_norm[i];
-    }
-
-    rbpf_real_t inv_sum = 1.0f / sum_w;
-    for (int i = 0; i < n; i++)
-    {
-        rbpf->w_norm[i] *= inv_sum;
-    }
-
-    /* Compute weighted average log-likelihood */
-    rbpf_real_t avg_log_lik = max_log_w + rbpf_log(sum_w / n);
-
-    return avg_log_lik;
+    /*
+     * NOTE: We do NOT normalize w_norm here - that's done in rbpf_ksc_compute_outputs()
+     * Return marginal likelihood (average observation likelihood across particles)
+     */
+    return total_marginal / n;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -388,13 +287,8 @@ rbpf_real_t rbpf_ksc_update_robust(
  * Computes the weighted average posterior probability that the observation
  * came from the outlier component (across all particles).
  *
- * Use for:
- *   - Monitoring: High values indicate fat-tail event
- *   - Diagnostics: Should spike on injected outliers
- *   - Alerting: Threshold crossings indicate market stress
- *
  * @param rbpf          RBPF filter state
- * @param y             Transformed observation: y = log(r²) where r is raw return
+ * @param y             Transformed observation: y = log(r²)
  * @param robust_ocsn   Robust OCSN configuration
  * @return              Weighted average P(outlier | obs) in [0, 1]
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -406,59 +300,87 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
 {
     if (!rbpf || !robust_ocsn || !robust_ocsn->enabled)
     {
-        return 0.0f;
+        return RBPF_REAL(0.0);
     }
 
     const int n = rbpf->n_particles;
+    const rbpf_real_t NEG_HALF = RBPF_REAL(-0.5);
 
-    /* y is ALREADY transformed: y = log(r²) */
-    rbpf_real_t obs = y;
-
-    rbpf_real_t weighted_sum = 0.0f;
-
-    /* Use predicted state (matches what was used in update) */
     const rbpf_real_t *mu_pred = rbpf->mu_pred;
+    const rbpf_real_t *var_pred = rbpf->var_pred;
+    const rbpf_real_t *w_norm = rbpf->w_norm;
+    const int *regime = rbpf->regime;
+
+    rbpf_real_t weighted_sum = RBPF_REAL(0.0);
 
     for (int i = 0; i < n; i++)
     {
-        int regime = rbpf->regime[i];
-        rbpf_real_t h = mu_pred[i]; /* Use PREDICTED state */
-        rbpf_real_t weight = rbpf->w_norm[i];
+        int r = regime[i];
+        rbpf_real_t h = mu_pred[i];
+        rbpf_real_t P = var_pred[i];
+        rbpf_real_t w = w_norm[i];
 
-        /* Get regime-specific parameters */
-        rbpf_real_t pi_out = robust_ocsn->regime[regime].prob;
-        rbpf_real_t var_out = robust_ocsn->regime[regime].variance;
+        /* Get outlier parameters */
+        rbpf_real_t pi_out = robust_ocsn->regime[r].prob;
+        rbpf_real_t var_out = robust_ocsn->regime[r].variance;
 
-        /* Clamp variance */
         if (var_out < RBPF_OUTLIER_VAR_MIN)
             var_out = RBPF_OUTLIER_VAR_MIN;
         if (var_out > RBPF_OUTLIER_VAR_MAX)
             var_out = RBPF_OUTLIER_VAR_MAX;
 
-        /* Compute likelihoods */
-        rbpf_real_t log_lik_ocsn = compute_ocsn_log_likelihood(obs, h);
-        rbpf_real_t log_lik_out = gaussian_log_pdf(obs, h, var_out);
-
-        /* Combined likelihood */
         rbpf_real_t log_1_minus_pi = rbpf_log(1.0f - pi_out);
         rbpf_real_t log_pi = rbpf_log(pi_out);
 
-        rbpf_real_t log_lik_combined = log_sum_exp_2(
-            log_1_minus_pi + log_lik_ocsn,
-            log_pi + log_lik_out);
+        /* Compute log-likelihoods for all components */
+        rbpf_real_t max_log_lik = RBPF_REAL(-1e30);
+        rbpf_real_t log_liks[11];
 
-        /* Posterior outlier probability */
-        rbpf_real_t log_post_out = log_pi + log_lik_out - log_lik_combined;
-        rbpf_real_t post_out = rbpf_exp(log_post_out);
+        /* OCSN components */
+        for (int k = 0; k < 10; k++)
+        {
+            rbpf_real_t innov = y - OCSN_MEAN[k] - H_OBS * h;
+            rbpf_real_t S = H2_OBS * P + OCSN_VAR[k];
+
+            log_liks[k] = log_1_minus_pi + OCSN_LOG_PROB[k] +
+                          NEG_HALF * (rbpf_log(S) + innov * innov / S);
+
+            if (log_liks[k] > max_log_lik)
+                max_log_lik = log_liks[k];
+        }
+
+        /* Outlier component */
+        {
+            rbpf_real_t innov = y - H_OBS * h;
+            rbpf_real_t S = H2_OBS * P + var_out;
+
+            log_liks[10] = log_pi + NEG_HALF * (rbpf_log(S) + innov * innov / S);
+
+            if (log_liks[10] > max_log_lik)
+                max_log_lik = log_liks[10];
+        }
+
+        /* Compute posterior probability of outlier */
+        rbpf_real_t sum_lik = RBPF_REAL(0.0);
+        rbpf_real_t lik_out = RBPF_REAL(0.0);
+
+        for (int k = 0; k < 11; k++)
+        {
+            rbpf_real_t lik = rbpf_exp(log_liks[k] - max_log_lik);
+            sum_lik += lik;
+            if (k == 10)
+                lik_out = lik;
+        }
+
+        rbpf_real_t post_out = lik_out / (sum_lik + RBPF_REAL(1e-30));
 
         /* Clamp */
-        if (post_out < 0.0f)
-            post_out = 0.0f;
-        if (post_out > 1.0f)
-            post_out = 1.0f;
+        if (post_out < RBPF_REAL(0.0))
+            post_out = RBPF_REAL(0.0);
+        if (post_out > RBPF_REAL(1.0))
+            post_out = RBPF_REAL(1.0);
 
-        /* Accumulate weighted by particle weight */
-        weighted_sum += weight * post_out;
+        weighted_sum += w * post_out;
     }
 
     return weighted_sum;
