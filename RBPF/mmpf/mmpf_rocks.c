@@ -432,7 +432,14 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.base_stickiness = RBPF_REAL(0.98);
     cfg.min_stickiness = RBPF_REAL(0.85);
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
+    cfg.min_mixing_prob = RBPF_REAL(0.01); /* 1% minimum transition probability */
     cfg.enable_adaptive_stickiness = 1;
+
+    /* Zero return handling (HFT critical)
+     * Policy: 0=skip update, 1=use floor, 2=censored interval (not implemented)
+     * Default: use floor at log(min_tick²) ≈ -18.0 for typical HFT instruments */
+    cfg.zero_return_policy = 1;               /* Use floor */
+    cfg.min_log_return_sq = RBPF_REAL(-18.0); /* ~exp(-9) ≈ 0.0001 = 1bp */
 
     /* Initial weights: slight bias toward calm */
     cfg.initial_weights[MMPF_CALM] = RBPF_REAL(0.6);
@@ -482,12 +489,15 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
     rbpf_real_t base = mmpf->config.base_stickiness;
     rbpf_real_t min_s = mmpf->config.min_stickiness;
     rbpf_real_t outlier = mmpf->outlier_fraction;
+    rbpf_real_t min_mix = mmpf->config.min_mixing_prob;
 
     /* Higher outlier fraction → lower stickiness */
     rbpf_real_t stickiness = base - (base - min_s) * outlier;
     mmpf->current_stickiness = stickiness;
 
-    /* Build transition matrix */
+    /* Build transition matrix with minimum mixing probability
+     * This prevents regime lock-in by ensuring each model always has
+     * at least min_mixing_prob chance of receiving particles */
     for (int i = 0; i < MMPF_N_MODELS; i++)
     {
         rbpf_real_t stay = stickiness;
@@ -498,7 +508,16 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
             stay *= mmpf->config.crisis_exit_boost;
         }
 
+        /* Compute base transition probability */
         rbpf_real_t leave = (RBPF_REAL(1.0) - stay) / (MMPF_N_MODELS - 1);
+
+        /* Apply minimum mixing probability floor */
+        if (leave < min_mix)
+        {
+            leave = min_mix;
+            /* Adjust stay probability to maintain normalization */
+            stay = RBPF_REAL(1.0) - leave * (MMPF_N_MODELS - 1);
+        }
 
         for (int j = 0; j < MMPF_N_MODELS; j++)
         {
@@ -911,7 +930,46 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
     }
 
-    /* 6. Step each RBPF with ROBUST OCSN and cache outputs
+    /* 6. Handle zero/near-zero returns (HFT CRITICAL)
+     *
+     * In HFT, price often doesn't move for many ticks (r_t = 0).
+     * Naive handling treats r=0 as σ ≈ exp(-11.5) ≈ 0.00001, which:
+     *   1. Biases the filter toward impossibly low volatility
+     *   2. Causes ESS collapse when price finally ticks
+     *
+     * Solutions:
+     *   0 = Skip update entirely (treat as censored/missing data)
+     *   1 = Use configurable floor (min_log_return_sq)
+     *   2 = Interval likelihood (not implemented - complex)
+     */
+    int skip_update = 0;
+    rbpf_real_t y_log;
+
+    if (rbpf_fabs(y) < RBPF_REAL(1e-10))
+    {
+        switch (mmpf->config.zero_return_policy)
+        {
+        case 0: /* Skip update - treat as censored data */
+            skip_update = 1;
+            y_log = RBPF_REAL(0.0); /* Won't be used */
+            break;
+        case 1: /* Use floor */
+        default:
+            y_log = mmpf->config.min_log_return_sq;
+            break;
+        }
+    }
+    else
+    {
+        y_log = rbpf_log(y * y);
+        /* Also clamp to floor to prevent extremely negative values */
+        if (y_log < mmpf->config.min_log_return_sq)
+        {
+            y_log = mmpf->config.min_log_return_sq;
+        }
+    }
+
+    /* 7. Step each RBPF with ROBUST OCSN and cache outputs
      *
      * CRITICAL: We call the individual RBPF functions directly instead of
      * rbpf_ksc_step() to use the robust OCSN update path.
@@ -920,47 +978,60 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
      * We need rbpf_ksc_update_robust() for outlier detection + adaptive stickiness.
      */
 
-    /* Transform observation once: y_log = log(r²) */
-    rbpf_real_t y_log;
-    if (rbpf_fabs(y) < RBPF_REAL(1e-10))
-    {
-        y_log = RBPF_REAL(-23.0); /* Floor at ~log(1e-10²) */
-    }
-    else
-    {
-        y_log = rbpf_log(y * y);
-    }
-
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
         RBPF_KSC *rbpf = mmpf->rbpf[k];
         RBPF_KSC_Output *out = &mmpf->model_output[k];
 
-        /* 6a. Regime transition */
+        /* 7a. Regime transition */
         rbpf_ksc_transition(rbpf);
 
-        /* 6b. Kalman predict */
+        /* 7b. Kalman predict */
         rbpf_ksc_predict(rbpf);
 
-        /* 6c. Robust OCSN update (with outlier component) */
         rbpf_real_t marginal_lik;
-        if (mmpf->robust_ocsn.enabled)
+
+        if (skip_update)
         {
-            marginal_lik = rbpf_ksc_update_robust(rbpf, y_log, &mmpf->robust_ocsn);
+            /* Skip update - just use predict-only state
+             * Marginal likelihood = 1.0 (no information) */
+            marginal_lik = RBPF_REAL(1.0);
+
+            /* Copy predict to posterior (no update) */
+            for (int i = 0; i < rbpf->n_particles; i++)
+            {
+                rbpf->mu[i] = rbpf->mu_pred[i];
+                rbpf->var[i] = rbpf->var_pred[i];
+            }
         }
         else
         {
-            marginal_lik = rbpf_ksc_update(rbpf, y_log);
+            /* 7c. Robust OCSN update (with outlier component) */
+            if (mmpf->robust_ocsn.enabled)
+            {
+                marginal_lik = rbpf_ksc_update_robust(rbpf, y_log, &mmpf->robust_ocsn);
+            }
+            else
+            {
+                marginal_lik = rbpf_ksc_update(rbpf, y_log);
+            }
         }
 
-        /* 6d. Compute outputs (before resample) */
+        /* 7d. Compute outputs (before resample) */
         rbpf_ksc_compute_outputs(rbpf, marginal_lik, out);
 
-        /* 6e. Resample if needed */
-        out->resampled = rbpf_ksc_resample(rbpf);
+        /* 7e. Resample if needed (skip if update was skipped - weights are uniform) */
+        if (!skip_update)
+        {
+            out->resampled = rbpf_ksc_resample(rbpf);
+        }
+        else
+        {
+            out->resampled = 0;
+        }
 
-        /* 6f. Compute outlier fraction for this model */
-        if (mmpf->robust_ocsn.enabled)
+        /* 7f. Compute outlier fraction for this model */
+        if (mmpf->robust_ocsn.enabled && !skip_update)
         {
             out->outlier_fraction = rbpf_ksc_compute_outlier_fraction(
                 rbpf, y_log, &mmpf->robust_ocsn);
@@ -1027,14 +1098,52 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         mmpf->weighted_log_vol += mmpf->weights[k] * mmpf->model_output[k].log_vol_mean;
     }
 
-    /* Compute volatility std across models: sqrt(E[V²] - E[V]²) */
-    rbpf_real_t vol_sq_sum = RBPF_REAL(0.0);
+    /* Compute volatility uncertainty using Law of Total Variance:
+     *
+     *   Var[V] = E[Var[V|M]] + Var[E[V|M]]
+     *          = within_model_var + between_model_var
+     *
+     * Current code only computed between-model variance (model disagreement).
+     * Missing within-model variance (each model's internal uncertainty).
+     *
+     * For Kelly sizing: f = μ / σ². Underestimating σ² leads to overbetting
+     * when models agree but are individually uncertain.
+     *
+     * For log-normal volatility: Var[exp(h)] = exp(2μ + σ²)(exp(σ²) - 1)
+     * Approximation: Var[V] ≈ V² × Var[log(V)] for small variance
+     */
+
+    /* Between-model variance: Var[E[V|M]] = Σ w_k (μ_k - μ̄)² */
+    rbpf_real_t between_var = RBPF_REAL(0.0);
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
         rbpf_real_t diff = mmpf->model_output[k].vol_mean - mmpf->weighted_vol;
-        vol_sq_sum += mmpf->weights[k] * diff * diff;
+        between_var += mmpf->weights[k] * diff * diff;
     }
-    mmpf->weighted_vol_std = rbpf_sqrt(vol_sq_sum);
+    mmpf->between_model_var = between_var;
+
+    /* Within-model variance: E[Var[V|M]] = Σ w_k × σ²_k
+     *
+     * Each model has log_vol_var = Var[h] from Kalman filter.
+     * For V = exp(h): Var[V] ≈ V² × Var[h] (delta method approximation)
+     * More precise: Var[exp(h)] = exp(2μ + σ²)(exp(σ²) - 1)
+     */
+    rbpf_real_t within_var = RBPF_REAL(0.0);
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        rbpf_real_t log_vol_var = mmpf->model_output[k].log_vol_var;
+        rbpf_real_t vol_mean = mmpf->model_output[k].vol_mean;
+
+        /* Delta method: Var[exp(h)] ≈ exp(h)² × Var[h] = V² × σ²_h */
+        rbpf_real_t model_var = vol_mean * vol_mean * log_vol_var;
+
+        within_var += mmpf->weights[k] * model_var;
+    }
+    mmpf->within_model_var = within_var;
+
+    /* Total variance = between + within */
+    rbpf_real_t total_var = between_var + within_var;
+    mmpf->weighted_vol_std = rbpf_sqrt(total_var);
 
     /* 9. Determine dominant model and compute weighted outlier fraction */
     int dom = argmax(mmpf->weights, MMPF_N_MODELS);
@@ -1069,12 +1178,16 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         output->volatility = mmpf->weighted_vol;
         output->log_volatility = mmpf->weighted_log_vol;
         output->volatility_std = mmpf->weighted_vol_std;
+        output->between_model_var = between_var;
+        output->within_model_var = within_var;
+        output->update_skipped = skip_update;
 
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
             output->weights[k] = mmpf->weights[k];
             output->model_vol[k] = mmpf->model_output[k].vol_mean;
             output->model_log_vol[k] = mmpf->model_output[k].log_vol_mean;
+            output->model_log_vol_var[k] = mmpf->model_output[k].log_vol_var;
             output->model_likelihood[k] = mmpf->model_likelihood[k];
             output->model_ess[k] = mmpf->model_output[k].ess;
         }
