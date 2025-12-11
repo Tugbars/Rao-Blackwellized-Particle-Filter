@@ -146,6 +146,16 @@ extern "C"
         /* OCSN-driven adaptive stickiness */
         int enable_adaptive_stickiness; /* 1 = adjust stickiness based on outliers */
 
+        /* Storvik parameter learning sync
+         *
+         * When enabled (default=1): Storvik learned params → RBPF particle_mu_vol
+         * When disabled (0): RBPF uses fixed hypothesis params, no learning adaptation
+         *
+         * Disable for unit tests that verify hypothesis discrimination - learning
+         * causes all models to converge toward similar params, destroying discrimination.
+         */
+        int enable_storvik_sync;
+
         /* Zero return handling (critical for HFT) */
         int zero_return_policy;        /* 0=skip update, 1=use floor, 2=censored interval */
         rbpf_real_t min_log_return_sq; /* Floor for log(r²) when r≈0 (default: -18.0) */

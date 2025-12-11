@@ -434,6 +434,7 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
     cfg.min_mixing_prob = RBPF_REAL(0.01); /* 1% minimum transition probability */
     cfg.enable_adaptive_stickiness = 1;
+    cfg.enable_storvik_sync = 1; /* Enable by default; disable for hypothesis discrimination tests */
 
     /* Zero return handling (HFT critical)
      * Policy: 0=skip update, 1=use floor, 2=censored interval (not implemented)
@@ -763,8 +764,13 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         }
         param_learn_broadcast_priors(mmpf->learner[k]);
 
-        /* CRITICAL: Sync initial params from Storvik → RBPF */
-        mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+        /* CRITICAL: Sync initial params from Storvik → RBPF
+         * Only if learning sync is enabled. When disabled (for unit tests),
+         * RBPF uses fixed global hypothesis params for discrimination. */
+        if (cfg.enable_storvik_sync)
+        {
+            mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+        }
     }
 
     /* Create particle buffers for IMM mixing */
@@ -924,10 +930,16 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
      * imm_mixing_step() imports mixed particles into Storvik's SoA buffers,
      * but rbpf_ksc_predict() reads from RBPF's particle_mu_vol/particle_sigma_vol.
      * Without this sync, RBPF uses stale parameters and ignores all learning!
+     *
+     * NOTE: Disable for unit tests that verify hypothesis discrimination.
+     * When sync is enabled, all models converge toward similar params.
      */
-    for (int k = 0; k < MMPF_N_MODELS; k++)
+    if (mmpf->config.enable_storvik_sync)
     {
-        mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+        }
     }
 
     /* 6. Handle zero/near-zero returns (HFT CRITICAL)

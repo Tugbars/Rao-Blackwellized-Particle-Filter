@@ -198,7 +198,13 @@ static inline float fast_exp_f32(float x)
 #ifdef RBPF_SIMD_AVX2
 
 /**
- * Accurate log for 8 floats (AVX2) - uses scalar logf for precision
+ * Log for 8 floats (AVX2) - scalar fallback for correctness
+ *
+ * TODO: Replace with properly tested SIMD approximation (Sleef, VCL, or
+ * Cephes-style polynomial with range reduction). The naive polynomial
+ * approach has >5% error for mantissa near 2.0, which breaks likelihood ratios.
+ *
+ * For now, use scalar logf which is correct but slower.
  */
 static inline __m256 accurate_log_avx2(__m256 x)
 {
@@ -220,7 +226,7 @@ static inline __m256 accurate_log_avx2(__m256 x)
 }
 
 /**
- * Accurate exp for 8 floats (AVX2) - uses scalar expf for precision
+ * Exp for 8 floats (AVX2) - scalar fallback for correctness
  */
 static inline __m256 accurate_exp_avx2(__m256 x)
 {
@@ -280,7 +286,9 @@ static inline float hmax_avx2(__m256 v)
 #ifdef RBPF_SIMD_AVX512
 
 /**
- * Accurate log for 16 floats (AVX-512) - uses scalar logf for precision
+ * Log for 16 floats (AVX-512) - scalar fallback for correctness
+ *
+ * TODO: Use Intel SVML or Sleef library for proper SIMD transcendentals.
  */
 static inline __m512 accurate_log_avx512(__m512 x)
 {
@@ -298,7 +306,7 @@ static inline __m512 accurate_log_avx512(__m512 x)
 }
 
 /**
- * Accurate exp for 16 floats (AVX-512) - uses scalar expf for precision
+ * Exp for 16 floats (AVX-512) - scalar fallback for correctness
  */
 static inline __m512 accurate_exp_avx512(__m512 x)
 {
@@ -530,11 +538,21 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
                 lik_out = lik;
         }
 
-        rbpf_real_t post_out = lik_out / (sum_lik + RBPF_REAL(1e-30));
-        if (post_out < RBPF_REAL(0.0))
-            post_out = RBPF_REAL(0.0);
-        if (post_out > RBPF_REAL(1.0))
-            post_out = RBPF_REAL(1.0);
+        /* Numerical safety: if all likelihoods collapsed (extreme observation),
+         * treat as outlier. This prevents "not an outlier" on garbage data. */
+        rbpf_real_t post_out;
+        if (sum_lik < RBPF_REAL(1e-35))
+        {
+            post_out = RBPF_REAL(1.0); /* Total collapse = outlier */
+        }
+        else
+        {
+            post_out = lik_out / (sum_lik + RBPF_REAL(1e-30));
+            if (post_out < RBPF_REAL(0.0))
+                post_out = RBPF_REAL(0.0);
+            if (post_out > RBPF_REAL(1.0))
+                post_out = RBPF_REAL(1.0);
+        }
 
         weighted_sum += w * post_out;
     }
@@ -831,9 +849,17 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
         float lik_out = expf(log_lik_out - max_log_lik);
         sum_lik += lik_out;
 
-        /* Posterior probability of outlier */
-        float post_out = lik_out / (sum_lik + 1e-30f);
-        post_out = fmaxf(0.0f, fminf(1.0f, post_out));
+        /* Numerical safety: if all likelihoods collapsed, treat as outlier */
+        float post_out;
+        if (sum_lik < 1e-35f)
+        {
+            post_out = 1.0f; /* Total collapse = outlier */
+        }
+        else
+        {
+            post_out = lik_out / (sum_lik + 1e-30f);
+            post_out = fmaxf(0.0f, fminf(1.0f, post_out));
+        }
 
         weighted_sum += w * post_out;
     }
@@ -1074,8 +1100,17 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
         float lik_out = expf(log_lik_out - max_log_lik);
         sum_lik += lik_out;
 
-        float post_out = lik_out / (sum_lik + 1e-30f);
-        post_out = fmaxf(0.0f, fminf(1.0f, post_out));
+        /* Numerical safety: if all likelihoods collapsed, treat as outlier */
+        float post_out;
+        if (sum_lik < 1e-35f)
+        {
+            post_out = 1.0f; /* Total collapse = outlier */
+        }
+        else
+        {
+            post_out = lik_out / (sum_lik + 1e-30f);
+            post_out = fmaxf(0.0f, fminf(1.0f, post_out));
+        }
 
         weighted_sum += w * post_out;
     }
