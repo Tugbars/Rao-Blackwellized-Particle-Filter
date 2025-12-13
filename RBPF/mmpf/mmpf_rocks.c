@@ -219,12 +219,14 @@ void mmpf_buffer_destroy(MMPF_ParticleBuffer *buf)
     }
 }
 
-void mmpf_buffer_export(MMPF_ParticleBuffer *buf,
-                        const RBPF_KSC *rbpf,
-                        const ParamLearner *learner)
+void mmpf_buffer_export(MMPF_ParticleBuffer *buf, const RBPF_Extended *ext)
 {
     const int n = buf->n_particles;
     const int nr = buf->n_storvik_regimes;
+
+    /* Get underlying RBPF and Storvik from RBPF_Extended */
+    const RBPF_KSC *rbpf = ext->rbpf;
+    const ParamLearner *learner = &ext->storvik;
 
     /* Export RBPF state */
     memcpy(buf->mu, rbpf->mu, n * sizeof(rbpf_real_t));
@@ -233,26 +235,25 @@ void mmpf_buffer_export(MMPF_ParticleBuffer *buf,
     memcpy(buf->log_weight, rbpf->log_weight, n * sizeof(rbpf_real_t));
 
     /* Export Storvik stats */
-    if (learner)
-    {
-        const StorvikSoA *soa = param_learn_get_active_soa_const(learner);
-        const size_t storvik_size = (size_t)n * nr * sizeof(param_real);
+    const StorvikSoA *soa = param_learn_get_active_soa_const(learner);
+    const size_t storvik_size = (size_t)n * nr * sizeof(param_real);
 
-        memcpy(buf->storvik_m, soa->m, storvik_size);
-        memcpy(buf->storvik_kappa, soa->kappa, storvik_size);
-        memcpy(buf->storvik_alpha, soa->alpha, storvik_size);
-        memcpy(buf->storvik_beta, soa->beta, storvik_size);
-        memcpy(buf->storvik_mu, soa->mu_cached, storvik_size);
-        memcpy(buf->storvik_sigma, soa->sigma_cached, storvik_size);
-    }
+    memcpy(buf->storvik_m, soa->m, storvik_size);
+    memcpy(buf->storvik_kappa, soa->kappa, storvik_size);
+    memcpy(buf->storvik_alpha, soa->alpha, storvik_size);
+    memcpy(buf->storvik_beta, soa->beta, storvik_size);
+    memcpy(buf->storvik_mu, soa->mu_cached, storvik_size);
+    memcpy(buf->storvik_sigma, soa->sigma_cached, storvik_size);
 }
 
-void mmpf_buffer_import(const MMPF_ParticleBuffer *buf,
-                        RBPF_KSC *rbpf,
-                        ParamLearner *learner)
+void mmpf_buffer_import(const MMPF_ParticleBuffer *buf, RBPF_Extended *ext)
 {
     const int n = buf->n_particles;
     const int nr = buf->n_storvik_regimes;
+
+    /* Get underlying RBPF and Storvik from RBPF_Extended */
+    RBPF_KSC *rbpf = ext->rbpf;
+    ParamLearner *learner = &ext->storvik;
 
     /* Import RBPF state */
     memcpy(rbpf->mu, buf->mu, n * sizeof(rbpf_real_t));
@@ -261,18 +262,15 @@ void mmpf_buffer_import(const MMPF_ParticleBuffer *buf,
     memcpy(rbpf->log_weight, buf->log_weight, n * sizeof(rbpf_real_t));
 
     /* Import Storvik stats */
-    if (learner)
-    {
-        StorvikSoA *soa = param_learn_get_active_soa(learner);
-        const size_t storvik_size = (size_t)n * nr * sizeof(param_real);
+    StorvikSoA *soa = param_learn_get_active_soa(learner);
+    const size_t storvik_size = (size_t)n * nr * sizeof(param_real);
 
-        memcpy(soa->m, buf->storvik_m, storvik_size);
-        memcpy(soa->kappa, buf->storvik_kappa, storvik_size);
-        memcpy(soa->alpha, buf->storvik_alpha, storvik_size);
-        memcpy(soa->beta, buf->storvik_beta, storvik_size);
-        memcpy(soa->mu_cached, buf->storvik_mu, storvik_size);
-        memcpy(soa->sigma_cached, buf->storvik_sigma, storvik_size);
-    }
+    memcpy(soa->m, buf->storvik_m, storvik_size);
+    memcpy(soa->kappa, buf->storvik_kappa, storvik_size);
+    memcpy(soa->alpha, buf->storvik_alpha, storvik_size);
+    memcpy(soa->beta, buf->storvik_beta, storvik_size);
+    memcpy(soa->mu_cached, buf->storvik_mu, storvik_size);
+    memcpy(soa->sigma_cached, buf->storvik_sigma, storvik_size);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -337,10 +335,13 @@ static void mmpf_convert_double_to_float(
 #endif
 }
 
-static void mmpf_sync_parameters(RBPF_KSC *rbpf, const ParamLearner *learner)
+static void mmpf_sync_parameters(RBPF_Extended *ext)
 {
-    if (!rbpf || !learner)
+    if (!ext)
         return;
+
+    RBPF_KSC *rbpf = ext->rbpf;
+    const ParamLearner *learner = &ext->storvik;
 
     const StorvikSoA *soa = param_learn_get_active_soa_const(learner);
     const int n = rbpf->n_particles;
@@ -641,13 +642,11 @@ static void stratified_resample_from_buffer(
 /* Perform IMM mixing step */
 static void imm_mixing_step(MMPF_ROCKS *mmpf)
 {
-    const int n = mmpf->n_particles;
-    const int nr = mmpf->config.n_storvik_regimes;
 
     /* 1. Export particles from all models to buffers */
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        mmpf_buffer_export(mmpf->buffer[k], mmpf->rbpf[k], mmpf->learner[k]);
+        mmpf_buffer_export(mmpf->buffer[k], mmpf->ext[k]);
     }
 
     /* 2. For each target model, draw particles from combined pool */
@@ -688,7 +687,7 @@ static void imm_mixing_step(MMPF_ROCKS *mmpf)
     /* 3. Import mixed particles back into models */
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        mmpf_buffer_import(mmpf->mixed_buffer[k], mmpf->rbpf[k], mmpf->learner[k]);
+        mmpf_buffer_import(mmpf->mixed_buffer[k], mmpf->ext[k]);
     }
 
     mmpf->imm_mix_count++;
@@ -713,11 +712,11 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     /* Initialize RNG */
     rbpf_pcg32_seed(&mmpf->rng, cfg.rng_seed, 1);
 
-    /* Create 3 RBPF instances */
+    /* Create 3 RBPF_Extended instances (each bundles RBPF + Storvik + OCSN) */
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        mmpf->rbpf[k] = rbpf_ksc_create(cfg.n_particles, cfg.n_ksc_regimes);
-        if (!mmpf->rbpf[k])
+        mmpf->ext[k] = rbpf_ext_create(cfg.n_particles, cfg.n_ksc_regimes, RBPF_PARAM_STORVIK);
+        if (!mmpf->ext[k])
         {
             mmpf_destroy(mmpf);
             return NULL;
@@ -729,50 +728,51 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         {
             /* Use same parameters for all KSC regimes within a hypothesis */
             /* The KSC regimes handle the mixture approximation, not volatility regimes */
-            rbpf_ksc_set_regime_params(mmpf->rbpf[k], r,
+            rbpf_ext_set_regime_params(mmpf->ext[k], r,
                                        RBPF_REAL(1.0) - hp->phi, /* theta = 1 - phi */
                                        hp->mu_vol,
                                        hp->sigma_eta);
         }
 
+        /* Configure per-hypothesis OCSN
+         * Each hypothesis has different outlier thresholds because the same
+         * observation means different things under different vol assumptions.
+         * A 5% move is a 6σ outlier for Calm but only 1.4σ for Crisis.
+         */
+        mmpf->ext[k]->robust_ocsn.enabled = cfg.robust_ocsn.enabled;
+        for (int r = 0; r < cfg.n_ksc_regimes; r++)
+        {
+            /* Scale outlier prob/variance by hypothesis:
+             * Calm:   tighter (lower outlier prob, lower variance)
+             * Crisis: looser (higher outlier prob, higher variance) */
+            rbpf_real_t scale = (k == MMPF_CALM) ? RBPF_REAL(0.8) : (k == MMPF_TREND) ? RBPF_REAL(1.0)
+                                                                                      : RBPF_REAL(1.5);
+
+            mmpf->ext[k]->robust_ocsn.regime[r].prob =
+                cfg.robust_ocsn.regime[r].prob * scale;
+            mmpf->ext[k]->robust_ocsn.regime[r].variance =
+                cfg.robust_ocsn.regime[r].variance * scale;
+        }
+
         /* Initialize particle state to hypothesis mu_vol */
-        rbpf_ksc_init(mmpf->rbpf[k], hp->mu_vol, RBPF_REAL(0.5));
-    }
+        rbpf_ext_init(mmpf->ext[k], hp->mu_vol, RBPF_REAL(0.5));
 
-    /* Create 3 Storvik learners */
-    for (int k = 0; k < MMPF_N_MODELS; k++)
-    {
-        mmpf->learner[k] = (ParamLearner *)malloc(sizeof(ParamLearner));
-        if (!mmpf->learner[k])
-        {
-            mmpf_destroy(mmpf);
-            return NULL;
-        }
-
-        if (param_learn_init(mmpf->learner[k], &cfg.storvik_config,
-                             cfg.n_particles, cfg.n_storvik_regimes) != 0)
-        {
-            mmpf_destroy(mmpf);
-            return NULL;
-        }
-
-        /* Set priors based on hypothesis */
-        MMPF_HypothesisParams *hp = &cfg.hypotheses[k];
+        /* Set Storvik priors based on hypothesis */
         for (int r = 0; r < cfg.n_storvik_regimes; r++)
         {
-            param_learn_set_prior(mmpf->learner[k], r,
+            param_learn_set_prior(&mmpf->ext[k]->storvik, r,
                                   (param_real)hp->mu_vol,
                                   (param_real)hp->phi,
                                   (param_real)hp->sigma_eta);
         }
-        param_learn_broadcast_priors(mmpf->learner[k]);
+        param_learn_broadcast_priors(&mmpf->ext[k]->storvik);
 
         /* CRITICAL: Sync initial params from Storvik → RBPF
          * Only if learning sync is enabled. When disabled (for unit tests),
          * RBPF uses fixed global hypothesis params for discrimination. */
         if (cfg.enable_storvik_sync)
         {
-            mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+            mmpf_sync_parameters(mmpf->ext[k]);
         }
     }
 
@@ -802,9 +802,6 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     mmpf->outlier_fraction = RBPF_REAL(0.0);
     update_transition_matrix(mmpf);
 
-    /* Copy robust OCSN config */
-    mmpf->robust_ocsn = cfg.robust_ocsn;
-
     /* Initialize regime tracking */
     mmpf->dominant = MMPF_CALM;
     mmpf->prev_dominant = MMPF_CALM;
@@ -827,7 +824,7 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
         /* Compute initial vol estimate from particle mean */
-        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
         rbpf_real_t sum_log_vol = RBPF_REAL(0.0);
         for (int i = 0; i < rbpf->n_particles; i++)
         {
@@ -856,13 +853,8 @@ void mmpf_destroy(MMPF_ROCKS *mmpf)
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        if (mmpf->rbpf[k])
-            rbpf_ksc_destroy(mmpf->rbpf[k]);
-        if (mmpf->learner[k])
-        {
-            param_learn_free(mmpf->learner[k]);
-            free(mmpf->learner[k]);
-        }
+        if (mmpf->ext[k])
+            rbpf_ext_destroy(mmpf->ext[k]);
         if (mmpf->buffer[k])
             mmpf_buffer_destroy(mmpf->buffer[k]);
         if (mmpf->mixed_buffer[k])
@@ -879,12 +871,12 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        rbpf_ksc_init(mmpf->rbpf[k], log_vol, var0);
-        param_learn_reset(mmpf->learner[k]);
-        param_learn_broadcast_priors(mmpf->learner[k]);
+        rbpf_ext_init(mmpf->ext[k], log_vol, var0);
+        param_learn_reset(&mmpf->ext[k]->storvik);
+        param_learn_broadcast_priors(&mmpf->ext[k]->storvik);
 
         /* CRITICAL: Sync initial params from Storvik → RBPF */
-        mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+        mmpf_sync_parameters(mmpf->ext[k]);
     }
 
     /* Reset weights */
@@ -952,7 +944,7 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
     {
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            mmpf_sync_parameters(mmpf->rbpf[k], mmpf->learner[k]);
+            mmpf_sync_parameters(mmpf->ext[k]);
         }
     }
 
@@ -995,18 +987,21 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
     }
 
-    /* 7. Step each RBPF with ROBUST OCSN and cache outputs
+    /* 7. Step each RBPF with PER-HYPOTHESIS OCSN and cache outputs
      *
-     * CRITICAL: We call the individual RBPF functions directly instead of
-     * rbpf_ksc_step() to use the robust OCSN update path.
+     * CRITICAL: Each hypothesis has its OWN OCSN configuration.
+     * A 5% move is a 6σ outlier for Calm but only 1.4σ for Crisis.
+     * Using per-hypothesis OCSN prevents cross-contamination of outlier signals.
      *
-     * rbpf_ksc_step() calls rbpf_ksc_update() which does NOT handle outliers.
-     * We need rbpf_ksc_update_robust() for outlier detection + adaptive stickiness.
+     * We call the individual RBPF functions directly instead of rbpf_ksc_step()
+     * to use the robust OCSN update path with hypothesis-specific parameters.
      */
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        RBPF_Extended *ext = mmpf->ext[k];
+        RBPF_KSC *rbpf = ext->rbpf;
+        RBPF_RobustOCSN *ocsn = &ext->robust_ocsn; /* Per-hypothesis OCSN */
         RBPF_KSC_Output *out = &mmpf->model_output[k];
 
         /* 7a. Regime transition */
@@ -1032,10 +1027,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
         else
         {
-            /* 7c. Robust OCSN update (with outlier component) */
-            if (mmpf->robust_ocsn.enabled)
+            /* 7c. Robust OCSN update with PER-HYPOTHESIS outlier params */
+            if (ocsn->enabled)
             {
-                marginal_lik = rbpf_ksc_update_robust(rbpf, y_log, &mmpf->robust_ocsn);
+                marginal_lik = rbpf_ksc_update_robust(rbpf, y_log, ocsn);
             }
             else
             {
@@ -1056,11 +1051,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
             out->resampled = 0;
         }
 
-        /* 7f. Compute outlier fraction for this model */
-        if (mmpf->robust_ocsn.enabled && !skip_update)
+        /* 7f. Compute outlier fraction for this model (using its OWN OCSN) */
+        if (ocsn->enabled && !skip_update)
         {
-            out->outlier_fraction = rbpf_ksc_compute_outlier_fraction(
-                rbpf, y_log, &mmpf->robust_ocsn);
+            out->outlier_fraction = rbpf_ksc_compute_outlier_fraction(rbpf, y_log, ocsn);
         }
         else
         {
@@ -1303,14 +1297,14 @@ rbpf_real_t mmpf_get_model_ess(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
     return mmpf->model_output[model].ess;
 }
 
-const RBPF_KSC *mmpf_get_rbpf(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
+const RBPF_Extended *mmpf_get_ext(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
 {
-    return mmpf->rbpf[model];
+    return mmpf->ext[model];
 }
 
-const ParamLearner *mmpf_get_learner(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
+rbpf_real_t mmpf_get_model_outlier_fraction(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
 {
-    return mmpf->learner[model];
+    return mmpf->model_output[model].outlier_fraction;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -1405,16 +1399,20 @@ void mmpf_inject_shock_ex(MMPF_ROCKS *mmpf, rbpf_real_t noise_multiplier)
      * This forces particles to spread out and explore wider μ_vol range.
      * The higher noise makes all hypotheses consider more possibilities,
      * allowing the likelihood to immediately determine the winner.
+     *
+     * q = sigma_vol² is the process variance used in Kalman predict.
+     * We scale sigma_vol and q together to maintain consistency.
      */
     mmpf->process_noise_multiplier = noise_multiplier;
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        /* Temporarily boost sigma_eta in each RBPF */
-        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        /* Temporarily boost sigma_vol in each RBPF */
+        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
         for (int r = 0; r < rbpf->n_regimes; r++)
         {
-            rbpf->params[r].sigma_eta *= noise_multiplier;
+            rbpf->params[r].sigma_vol *= noise_multiplier;
+            rbpf->params[r].q *= (noise_multiplier * noise_multiplier); /* q = sigma_vol² */
         }
     }
 
@@ -1441,13 +1439,15 @@ void mmpf_restore_from_shock(MMPF_ROCKS *mmpf)
 
     /* Restore process noise on all three RBPFs */
     rbpf_real_t inv_multiplier = RBPF_REAL(1.0) / mmpf->process_noise_multiplier;
+    rbpf_real_t inv_multiplier_sq = inv_multiplier * inv_multiplier;
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
         for (int r = 0; r < rbpf->n_regimes; r++)
         {
-            rbpf->params[r].sigma_eta *= inv_multiplier;
+            rbpf->params[r].sigma_vol *= inv_multiplier;
+            rbpf->params[r].q *= inv_multiplier_sq; /* q = sigma_vol² */
         }
     }
 

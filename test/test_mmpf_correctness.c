@@ -645,7 +645,9 @@ static void test_parameter_sync_after_step(void)
         /* Check that RBPF is using learned params */
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            RBPF_KSC *rbpf = mmpf->rbpf[k];
+            /* Access RBPF through RBPF_Extended */
+            const RBPF_Extended *ext = mmpf_get_ext(mmpf, (MMPF_Hypothesis)k);
+            RBPF_KSC *rbpf = ext->rbpf;
 
             char msg[64];
             snprintf(msg, sizeof(msg), "Model[%d] use_learned_params == 1", k);
@@ -690,7 +692,9 @@ static void test_parameter_sync_type_conversion(void)
         /* Check values are in reasonable range (not garbage from bad memcpy) */
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            RBPF_KSC *rbpf = mmpf->rbpf[k];
+            /* Access RBPF through RBPF_Extended */
+            const RBPF_Extended *ext = mmpf_get_ext(mmpf, (MMPF_Hypothesis)k);
+            RBPF_KSC *rbpf = ext->rbpf;
             int n = rbpf->n_particles;
             int n_regimes = rbpf->n_regimes;
 
@@ -749,7 +753,9 @@ static void test_imm_mixing_weights_valid(void)
             /* After each step, all models should have correct particle count */
             for (int k = 0; k < MMPF_N_MODELS; k++)
             {
-                int n = mmpf->rbpf[k]->n_particles;
+                /* Access RBPF through RBPF_Extended */
+                const RBPF_Extended *ext = mmpf_get_ext(mmpf, (MMPF_Hypothesis)k);
+                int n = ext->rbpf->n_particles;
                 char msg[64];
                 snprintf(msg, sizeof(msg), "Model[%d] particle count", k);
                 ASSERT_EQ_INT(n, mmpf->config.n_particles, msg);
