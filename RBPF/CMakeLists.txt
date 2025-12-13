@@ -173,6 +173,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_mmpf_correctness PRIVATE ${COMMON_DEFS})
     endif()
 
+    # MMPF real data integration test
+    if(RBPF_ENABLE_STORVIK)
+        add_executable(test_mmpf_real_data
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_real_data_test/test_mmpf_real_data.c
+        )
+        target_link_libraries(test_mmpf_real_data PRIVATE rocks)
+        target_compile_options(test_mmpf_real_data PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_mmpf_real_data PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage

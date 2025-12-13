@@ -18,9 +18,6 @@
 #include <math.h>
 #include <time.h>
 
-#ifdef MMPF_USE_TEST_STUB
-#include "rocks_test_stub.c"
-#endif
 #include "mmpf_rocks.h"
 
 /*═══════════════════════════════════════════════════════════════════════════
