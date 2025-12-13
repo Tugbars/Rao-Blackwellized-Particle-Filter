@@ -208,6 +208,26 @@ extern "C"
         rbpf_real_t mu_vol_offsets[MMPF_N_MODELS]; /* Relative offsets from baseline */
 
         /*═══════════════════════════════════════════════════════════════════════
+         * FAIR WEATHER GATE
+         *
+         * Prevents baseline corruption during crisis events. Crisis spikes are
+         * "weather" (temporary), not "climate" (structural). If we let the baseline
+         * drift up during COVID crash, it takes months to drift back down.
+         *
+         * Solution: Freeze baseline updates when w_crisis > threshold.
+         * Uses hysteresis to prevent flickering near the threshold.
+         *
+         * Example with defaults (gate_on=0.5, gate_off=0.4):
+         *   - Normal: w_crisis=0.1 → baseline updates normally
+         *   - Crisis hits: w_crisis=0.6 → baseline FROZEN
+         *   - Crisis persists: w_crisis=0.45 → still frozen (hysteresis)
+         *   - Crisis ends: w_crisis=0.35 → baseline UNFROZEN, resumes updating
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        rbpf_real_t baseline_gate_on;  /* Freeze when w_crisis > this (default: 0.5) */
+        rbpf_real_t baseline_gate_off; /* Unfreeze when w_crisis < this (default: 0.4) */
+
+        /*═══════════════════════════════════════════════════════════════════════
          * GATED DYNAMICS LEARNING
          *
          * When enabled, each hypothesis learns its OWN φ and σ_η from data
@@ -261,6 +281,10 @@ extern "C"
         /* Regime interpretation */
         int regime_stable;   /* 1 if dominant unchanged for N ticks */
         int ticks_in_regime; /* Consecutive ticks in current dominant */
+
+        /* Global baseline diagnostics */
+        rbpf_real_t global_mu_vol; /* Current baseline (for monitoring secular drift) */
+        int baseline_frozen;       /* 1 if baseline is frozen (Fair Weather Gate active) */
 
         /* Zero return handling */
         int update_skipped; /* 1 if observation was treated as censored */
@@ -399,6 +423,7 @@ extern "C"
 
         rbpf_real_t global_mu_vol;         /* Current baseline (updated each tick) */
         rbpf_real_t prev_weighted_log_vol; /* Previous output (for EWMA update) */
+        int baseline_frozen_ticks;         /* Ticks since baseline was frozen (0 = not frozen) */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GATED DYNAMICS LEARNING STATE
@@ -583,6 +608,24 @@ extern "C"
      * was an outlier under that hypothesis's world view.
      */
     rbpf_real_t mmpf_get_model_outlier_fraction(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model);
+
+    /**
+     * Get current global baseline (μ_vol).
+     * This tracks secular drift in volatility over time.
+     */
+    rbpf_real_t mmpf_get_global_baseline(const MMPF_ROCKS *mmpf);
+
+    /**
+     * Check if baseline is currently frozen (Fair Weather Gate active).
+     * Returns 1 if frozen (crisis detected), 0 if updating normally.
+     */
+    int mmpf_is_baseline_frozen(const MMPF_ROCKS *mmpf);
+
+    /**
+     * Get number of ticks baseline has been frozen.
+     * Returns 0 if not frozen, >0 if frozen for that many ticks.
+     */
+    int mmpf_get_baseline_frozen_ticks(const MMPF_ROCKS *mmpf);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API: IMM Control

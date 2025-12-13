@@ -438,6 +438,11 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* = baseline */
     cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(1.5); /* exp(1.5) = 4.5× trend vol */
 
+    /* Fair Weather Gate: freeze baseline during crisis to prevent corruption
+     * Hysteresis prevents flickering: freeze at 50%, unfreeze at 40% */
+    cfg.baseline_gate_on = RBPF_REAL(0.50);  /* Freeze when w_crisis > this */
+    cfg.baseline_gate_off = RBPF_REAL(0.40); /* Unfreeze when w_crisis < this */
+
     /* Gated dynamics learning */
     cfg.enable_gated_learning = 1;
     cfg.gated_learning_threshold = RBPF_REAL(0.0); /* Soft gate (weight by prob) */
@@ -877,6 +882,7 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
 
     mmpf->global_mu_vol = cfg.global_mu_vol_init;
     mmpf->prev_weighted_log_vol = cfg.global_mu_vol_init;
+    mmpf->baseline_frozen_ticks = 0; /* Not frozen at start */
 
     /* Initialize gated dynamics learners */
     for (int k = 0; k < MMPF_N_MODELS; k++)
@@ -966,6 +972,7 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 
     mmpf->global_mu_vol = log_vol;
     mmpf->prev_weighted_log_vol = log_vol;
+    mmpf->baseline_frozen_ticks = 0; /* Not frozen after reset */
 
     /* Reanchor hypotheses around new baseline */
     if (mmpf->config.enable_global_baseline)
@@ -1001,10 +1008,14 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 {
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 0: UPDATE GLOBAL BASELINE ("Climate")
+     * STEP 0: UPDATE GLOBAL BASELINE ("Climate") with FAIR WEATHER GATE
      *
      * Use slow EWMA on previous tick's weighted log-vol output.
      * This tracks secular drift (decade-scale) without chasing noise.
+     *
+     * FAIR WEATHER GATE: Crisis events are "weather" (temporary), not "climate"
+     * (structural). Freeze baseline updates when w_crisis is high to prevent
+     * corruption. Uses hysteresis to prevent flickering near threshold.
      *
      * Then reanchor each hypothesis = baseline + fixed offset.
      * This preserves discrimination while allowing adaptation.
@@ -1012,11 +1023,37 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
     if (mmpf->config.enable_global_baseline)
     {
-        /* Update baseline from previous output */
-        rbpf_real_t alpha = mmpf->config.global_mu_vol_alpha;
-        mmpf->global_mu_vol = alpha * mmpf->global_mu_vol + (RBPF_REAL(1.0) - alpha) * mmpf->prev_weighted_log_vol;
+        /* Fair Weather Gate with hysteresis */
+        rbpf_real_t w_crisis = mmpf->weights[MMPF_CRISIS];
+        int currently_frozen = (mmpf->baseline_frozen_ticks > 0);
+        int should_freeze = (w_crisis > mmpf->config.baseline_gate_on);
+        int should_unfreeze = (w_crisis < mmpf->config.baseline_gate_off);
 
-        /* Reanchor each hypothesis */
+        if (!currently_frozen && should_freeze)
+        {
+            /* Enter frozen state - crisis detected */
+            mmpf->baseline_frozen_ticks = 1;
+        }
+        else if (currently_frozen && should_unfreeze)
+        {
+            /* Exit frozen state - crisis ended, resume baseline tracking */
+            rbpf_real_t alpha = mmpf->config.global_mu_vol_alpha;
+            mmpf->global_mu_vol = alpha * mmpf->global_mu_vol + (RBPF_REAL(1.0) - alpha) * mmpf->prev_weighted_log_vol;
+            mmpf->baseline_frozen_ticks = 0;
+        }
+        else if (currently_frozen)
+        {
+            /* Still in crisis - keep baseline frozen, increment counter */
+            mmpf->baseline_frozen_ticks++;
+        }
+        else
+        {
+            /* Normal operation - update baseline */
+            rbpf_real_t alpha = mmpf->config.global_mu_vol_alpha;
+            mmpf->global_mu_vol = alpha * mmpf->global_mu_vol + (RBPF_REAL(1.0) - alpha) * mmpf->prev_weighted_log_vol;
+        }
+
+        /* Always reanchor hypotheses (even when baseline frozen) */
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
             rbpf_real_t mu_k = mmpf->global_mu_vol + mmpf->config.mu_vol_offsets[k];
@@ -1425,6 +1462,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
         output->regime_stable = (mmpf->ticks_in_regime >= 10) ? 1 : 0;
         output->ticks_in_regime = mmpf->ticks_in_regime;
+
+        /* Global baseline diagnostics */
+        output->global_mu_vol = mmpf->global_mu_vol;
+        output->baseline_frozen = (mmpf->baseline_frozen_ticks > 0) ? 1 : 0;
     }
 }
 
@@ -1502,6 +1543,21 @@ const RBPF_Extended *mmpf_get_ext(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
 rbpf_real_t mmpf_get_model_outlier_fraction(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
 {
     return mmpf->model_output[model].outlier_fraction;
+}
+
+rbpf_real_t mmpf_get_global_baseline(const MMPF_ROCKS *mmpf)
+{
+    return mmpf->global_mu_vol;
+}
+
+int mmpf_is_baseline_frozen(const MMPF_ROCKS *mmpf)
+{
+    return (mmpf->baseline_frozen_ticks > 0) ? 1 : 0;
+}
+
+int mmpf_get_baseline_frozen_ticks(const MMPF_ROCKS *mmpf)
+{
+    return mmpf->baseline_frozen_ticks;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
