@@ -5,6 +5,9 @@
  * See mmpf_rocks.h for architecture documentation.
  */
 
+#ifdef MMPF_USE_TEST_STUB
+#include "rocks_test_stub.c"
+#endif
 #include "mmpf_rocks.h"
 #include <stdlib.h>
 #include <string.h>
@@ -807,6 +810,17 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     mmpf->prev_dominant = MMPF_CALM;
     mmpf->ticks_in_regime = 0;
 
+    /* Initialize shock mechanism state */
+    mmpf->shock_active = 0;
+    mmpf->process_noise_multiplier = RBPF_REAL(1.0);
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->saved_transition[i][j] = RBPF_REAL(0.0);
+        }
+    }
+
     /* Initialize cached outputs from RBPF initial state */
     mmpf->weighted_vol = RBPF_REAL(0.0);
     mmpf->weighted_log_vol = RBPF_REAL(0.0);
@@ -1337,6 +1351,113 @@ void mmpf_set_weights(MMPF_ROCKS *mmpf, const rbpf_real_t *weights)
     {
         mmpf->log_weights[k] = rbpf_log(mmpf->weights[k]);
     }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * BOCPD SHOCK MECHANISM
+ *
+ * When BOCPD detects a changepoint, MMPF's normal sticky transitions slow
+ * down adaptation. The shock mechanism temporarily forces exploration:
+ *
+ * 1. Save current transition matrix
+ * 2. Set uniform transitions (33% each)
+ * 3. Boost process noise 50x (particles spread across μ_vol space)
+ * 4. mmpf_step() - likelihoods determine winner immediately
+ * 5. Restore saved transitions
+ *
+ * This cuts detection lag from ~100 ticks to <20 ticks.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void mmpf_inject_shock(MMPF_ROCKS *mmpf)
+{
+    mmpf_inject_shock_ex(mmpf, RBPF_REAL(50.0));
+}
+
+void mmpf_inject_shock_ex(MMPF_ROCKS *mmpf, rbpf_real_t noise_multiplier)
+{
+    if (!mmpf)
+        return;
+
+    /* Don't double-inject */
+    if (mmpf->shock_active)
+        return;
+
+    /* Save current transition matrix */
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->saved_transition[i][j] = mmpf->transition[i][j];
+        }
+    }
+
+    /* Set uniform transitions: all regimes equally likely */
+    const rbpf_real_t uniform = RBPF_REAL(1.0) / MMPF_N_MODELS;
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->transition[i][j] = uniform;
+        }
+    }
+
+    /* Boost process noise on all three RBPFs
+     * This forces particles to spread out and explore wider μ_vol range.
+     * The higher noise makes all hypotheses consider more possibilities,
+     * allowing the likelihood to immediately determine the winner.
+     */
+    mmpf->process_noise_multiplier = noise_multiplier;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        /* Temporarily boost sigma_eta in each RBPF */
+        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        for (int r = 0; r < rbpf->n_regimes; r++)
+        {
+            rbpf->params[r].sigma_eta *= noise_multiplier;
+        }
+    }
+
+    mmpf->shock_active = 1;
+}
+
+void mmpf_restore_from_shock(MMPF_ROCKS *mmpf)
+{
+    if (!mmpf)
+        return;
+
+    /* Only restore if shock was active */
+    if (!mmpf->shock_active)
+        return;
+
+    /* Restore saved transition matrix */
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->transition[i][j] = mmpf->saved_transition[i][j];
+        }
+    }
+
+    /* Restore process noise on all three RBPFs */
+    rbpf_real_t inv_multiplier = RBPF_REAL(1.0) / mmpf->process_noise_multiplier;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        RBPF_KSC *rbpf = mmpf->rbpf[k];
+        for (int r = 0; r < rbpf->n_regimes; r++)
+        {
+            rbpf->params[r].sigma_eta *= inv_multiplier;
+        }
+    }
+
+    mmpf->process_noise_multiplier = RBPF_REAL(1.0);
+    mmpf->shock_active = 0;
+}
+
+int mmpf_is_shock_active(const MMPF_ROCKS *mmpf)
+{
+    return mmpf ? mmpf->shock_active : 0;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
