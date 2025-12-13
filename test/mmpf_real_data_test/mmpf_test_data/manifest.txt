@@ -1,0 +1,9 @@
+# MMPF Test Data Manifest
+# Ticker: SPY
+# Generated: 2025-12-13T20:36:07.376262
+
+covid_2020: 81 rows
+bear_2022: 250 rows
+2023_2024: 459 rows
+intraday_1m: 2717 rows
+5year: 1255 rows

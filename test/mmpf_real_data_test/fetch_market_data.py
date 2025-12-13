@@ -8,7 +8,7 @@ Covers known volatility events:
   - Recent data (last 7 days, 1-minute)
   - Flash events if available
 
-Output: CSV files ready for C test harness
+Output: CSV files in mmpf_test_data subfolder (next to this script)
 """
 
 import yfinance as yf
@@ -32,11 +32,17 @@ def fetch_daily_data(ticker: str, start: str, end: str) -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
     
     df = df.reset_index()
-    df = df.rename(columns={'Date': 'timestamp', 'Adj Close': 'close', 'Close': 'close_raw'})
     
-    # Use adjusted close for returns
-    if 'Adj Close' in df.columns:
-        df['close'] = df['Adj Close']
+    # yfinance now uses auto_adjust=True by default
+    # So 'Close' is already adjusted, no 'Adj Close' column
+    if 'Close' in df.columns:
+        df = df.rename(columns={'Date': 'timestamp', 'Close': 'close'})
+    elif 'Adj Close' in df.columns:
+        # Fallback for older yfinance versions
+        df = df.rename(columns={'Date': 'timestamp', 'Adj Close': 'close'})
+    else:
+        print(f"    WARNING: No Close column found. Columns: {df.columns.tolist()}")
+        return pd.DataFrame()
     
     return df[['timestamp', 'close']].dropna()
 
@@ -54,9 +60,14 @@ def fetch_intraday_data(ticker: str, period: str = "7d", interval: str = "1m") -
         df.columns = df.columns.get_level_values(0)
     
     df = df.reset_index()
+    
     # Column name varies: 'Datetime' for intraday, 'Date' for daily
     time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
     df = df.rename(columns={time_col: 'timestamp', 'Close': 'close'})
+    
+    if 'close' not in df.columns:
+        print(f"    WARNING: No Close column found. Columns: {df.columns.tolist()}")
+        return pd.DataFrame()
     
     return df[['timestamp', 'close']].dropna()
 
@@ -91,6 +102,7 @@ def add_event_labels(df: pd.DataFrame, events: dict) -> pd.DataFrame:
 
 def save_dataset(df: pd.DataFrame, name: str, output_dir: Path):
     """Save dataset to CSV."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{name}.csv"
     
     # Format for C consumption
@@ -116,6 +128,7 @@ def fetch_all_datasets(output_dir: Path, ticker: str = "SPY"):
     print(f"\n{'='*60}")
     print(f"  MMPF Real Data Fetcher")
     print(f"  Ticker: {ticker}")
+    print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
     
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -225,12 +238,17 @@ def fetch_multi_asset(output_dir: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch market data for MMPF testing")
     parser.add_argument("--ticker", default="SPY", help="Ticker symbol (default: SPY)")
-    parser.add_argument("--output", default="./mmpf_test_data", help="Output directory")
+    parser.add_argument("--output", default=None, help="Output directory (default: mmpf_test_data in script dir)")
     parser.add_argument("--multi", action="store_true", help="Fetch multiple asset classes")
     
     args = parser.parse_args()
     
-    output_dir = Path(args.output)
+    # Default output: mmpf_test_data subfolder next to this script
+    if args.output is None:
+        script_dir = Path(__file__).parent
+        output_dir = script_dir / "mmpf_test_data"
+    else:
+        output_dir = Path(args.output)
     
     if args.multi:
         fetch_multi_asset(output_dir)
