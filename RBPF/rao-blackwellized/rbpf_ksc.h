@@ -21,11 +21,26 @@
  * OBSERVATION MODEL
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Returns:     r_t = σ_t × ε_t = exp(ℓ_t) × ε_t,    ε_t ~ N(0,1)
- * Transform:   y_t = log(r_t²) = 2ℓ_t + log(ε_t²)
- * Linear form: y_t = H·ℓ_t + noise,  where H = 2
+ * GAUSSIAN (Original KSC):
+ *   Returns:     r_t = σ_t × ε_t = exp(ℓ_t) × ε_t,    ε_t ~ N(0,1)
+ *   Transform:   y_t = log(r_t²) = 2ℓ_t + log(ε_t²)
+ *   Linear form: y_t = H·ℓ_t + noise,  where H = 2
  *
- * log(ε_t²) ~ log-χ²(1), approximated as 10-component Gaussian mixture (OCSN).
+ *   log(ε_t²) ~ log-χ²(1), approximated as 10-component Gaussian mixture (OCSN).
+ *
+ * STUDENT-T (Extension):
+ *   Returns:     r_t = σ_t × ε_t,    ε_t ~ t_ν(0,1)   ← Heavy tails
+ *   Scale mixture: ε_t | λ_t ~ N(0, 1/λ_t),  λ_t ~ Gamma(ν/2, ν/2)
+ *   Transform:   y_t = 2ℓ_t + log(ε_t²) = 2ℓ_t + log(χ²/λ_t)
+ *              = 2ℓ_t + log(χ²) - log(λ_t)
+ *
+ *   Given λ_t, this is standard KSC with shifted observation:
+ *     y_shifted = y_t + log(λ_t)
+ *
+ *   Regime-dependent ν enables structural fat-tail discrimination:
+ *     Calm:   ν=10 (near-Gaussian, 5σ event ~ 10⁻⁵)
+ *     Trend:  ν=5  (moderate tails, 5σ event ~ 10⁻³)
+ *     Crisis: ν=3  (heavy tails, 5σ event ~ 10⁻²)
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * GPB1 APPROXIMATION
@@ -37,7 +52,8 @@
  * Variance calculation uses law of total variance:
  *   Var[X] = E[Var[X|K]] + Var[E[X|K]] = E[X²] - E[X]²
  *
- * Latency target: <15μs for 1000 particles
+ * Latency target: <15μs for 1000 particles (Gaussian)
+ *                 <20μs for 1000 particles (Student-t with λ sampling)
  */
 
 #ifndef RBPF_KSC_H
@@ -69,6 +85,19 @@ extern "C"
 /* Liu-West parameter learning */
 #define RBPF_LW_LEARN_MU_VOL 1 /* Learn μ_vol per regime */
 #define RBPF_LW_LEARN_SIGMA 0  /* Learn σ_vol per regime (optional) */
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * STUDENT-T CONFIGURATION
+     *───────────────────────────────────────────────────────────────────────────*/
+
+/* Default degrees of freedom bounds for ν learning */
+#define RBPF_NU_FLOOR 2.5f   /* Below this, variance undefined */
+#define RBPF_NU_CEIL 30.0f   /* Above this, essentially Gaussian */
+#define RBPF_NU_DEFAULT 5.0f /* Moderate tails */
+
+/* Lambda (auxiliary variable) bounds */
+#define RBPF_LAMBDA_FLOOR 0.01f /* Prevent log(λ) → -∞ */
+#define RBPF_LAMBDA_CEIL 100.0f /* Prevent numerical issues */
 
     /*─────────────────────────────────────────────────────────────────────────────
      * PORTABLE SIMD HINTS
@@ -135,6 +164,7 @@ extern "C"
 /* MKL RNG */
 #define RBPF_VSL_RNG_UNIFORM vdRngUniform
 #define RBPF_VSL_RNG_GAUSSIAN vdRngGaussian
+#define RBPF_VSL_RNG_GAMMA vdRngGamma
 
 /* Constants */
 #define RBPF_REAL(x) (x)
@@ -174,6 +204,7 @@ typedef float rbpf_real_t;
 /* MKL RNG */
 #define RBPF_VSL_RNG_UNIFORM vsRngUniform
 #define RBPF_VSL_RNG_GAUSSIAN vsRngGaussian
+#define RBPF_VSL_RNG_GAMMA vsRngGamma
 
 /* Constants */
 #define RBPF_REAL(x) (x##f)
@@ -278,6 +309,55 @@ typedef float rbpf_real_t;
             q = rbpf_sqrt(RBPF_REAL(-2.0) * rbpf_log(RBPF_REAL(1.0) - p));
             return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
                    ((((d1 * q + d2) * q + d3) * q + d4) * q + RBPF_REAL(1.0));
+        }
+    }
+
+    /**
+     * Gamma sampler using Marsaglia-Tsang method
+     * Required for Student-t auxiliary variable sampling
+     *
+     * @param rng    PCG32 RNG state
+     * @param alpha  Shape parameter (must be > 0)
+     * @param beta   Rate parameter (must be > 0)
+     * @return       Sample from Gamma(alpha, beta)
+     */
+    static inline rbpf_real_t rbpf_pcg32_gamma(rbpf_pcg32_t *rng, rbpf_real_t alpha, rbpf_real_t beta)
+    {
+        /* Handle alpha < 1 via Ahrens-Dieter transformation */
+        if (alpha < RBPF_REAL(1.0))
+        {
+            rbpf_real_t u = rbpf_pcg32_uniform(rng);
+            return rbpf_pcg32_gamma(rng, alpha + RBPF_REAL(1.0), beta) * rbpf_pow(u, RBPF_REAL(1.0) / alpha);
+        }
+
+        /* Marsaglia-Tsang for alpha >= 1 */
+        rbpf_real_t d = alpha - RBPF_REAL(1.0) / RBPF_REAL(3.0);
+        rbpf_real_t c = RBPF_REAL(1.0) / rbpf_sqrt(RBPF_REAL(9.0) * d);
+
+        for (;;)
+        {
+            rbpf_real_t x, v;
+            do
+            {
+                x = rbpf_pcg32_gaussian(rng);
+                v = RBPF_REAL(1.0) + c * x;
+            } while (v <= RBPF_REAL(0.0));
+
+            v = v * v * v;
+            rbpf_real_t u = rbpf_pcg32_uniform(rng);
+            rbpf_real_t x2 = x * x;
+
+            /* Quick acceptance */
+            if (u < RBPF_REAL(1.0) - RBPF_REAL(0.0331) * x2 * x2)
+            {
+                return d * v / beta;
+            }
+
+            /* Slow acceptance */
+            if (rbpf_log(u) < RBPF_REAL(0.5) * x2 + d * (RBPF_REAL(1.0) - v + rbpf_log(v)))
+            {
+                return d * v / beta;
+            }
         }
     }
 
@@ -390,6 +470,55 @@ typedef float rbpf_real_t;
         RBPF_OutlierParams regime[RBPF_MAX_REGIMES]; /* Per-regime params */
     } RBPF_RobustOCSN;
 
+    /*═══════════════════════════════════════════════════════════════════════════
+     * STUDENT-T OBSERVATION MODEL CONFIGURATION
+     *
+     * Replaces Gaussian ε ~ N(0,1) with Student-t ε ~ t_ν(0,1)
+     *
+     * Key insight: t_ν is a scale mixture of Gaussians:
+     *   ε | λ ~ N(0, 1/λ),  λ ~ Gamma(ν/2, ν/2)
+     *
+     * Benefits:
+     *   - Fat tails are STRUCTURAL, not anomalies
+     *   - Regime-dependent ν enables natural discrimination
+     *   - Crisis with ν=3 expects fat tails → wins likelihood during crashes
+     *
+     * Implementation:
+     *   1. Sample λ from conditional posterior given observation
+     *   2. Run standard KSC update with shifted observation y + log(λ)
+     *   3. Accumulate λ statistics for optional ν learning
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    typedef struct
+    {
+        int enabled;          /* 0=Gaussian, 1=Student-t */
+        rbpf_real_t nu;       /* Degrees of freedom (default: 5) */
+        rbpf_real_t nu_floor; /* Minimum ν (default: 2.5) */
+        rbpf_real_t nu_ceil;  /* Maximum ν (default: 30) */
+
+        /* ν learning (optional - usually ν is structural/fixed) */
+        int learn_nu;                 /* 0=fixed, 1=learn from data */
+        rbpf_real_t nu_learning_rate; /* EWMA rate for ν estimation */
+    } RBPF_StudentT_Config;
+
+    /**
+     * Student-t sufficient statistics for ν learning
+     *
+     * Uses method of moments on sampled λ values:
+     *   E[λ] = 1,  Var[λ] = 2/ν  →  ν = 2/Var[λ]
+     *
+     * Or digamma method (more accurate):
+     *   E[log(λ)] = ψ(ν/2) - log(ν/2)
+     */
+    typedef struct
+    {
+        rbpf_real_t sum_lambda;     /* Σ λ (with forgetting) */
+        rbpf_real_t sum_lambda_sq;  /* Σ λ² (for variance) */
+        rbpf_real_t sum_log_lambda; /* Σ log(λ) (for digamma method) */
+        rbpf_real_t n_eff;          /* Effective sample count */
+        rbpf_real_t nu_estimate;    /* Current ν estimate */
+    } RBPF_StudentT_Stats;
+
     /**
      * Main RBPF-KSC structure
      */
@@ -448,6 +577,22 @@ typedef float rbpf_real_t;
         /* Pre-generated Gaussian randoms (MKL ICDF) */
         rbpf_real_t *rng_gaussian; /* [2*n] pre-generated N(0,1) for jitter */
         int rng_buffer_size;       /* Current buffer size */
+
+        /*========================================================================
+         * STUDENT-T AUXILIARY VARIABLES
+         *======================================================================*/
+        rbpf_real_t *lambda;     /* [n] Sampled scale variables (1/precision) */
+        rbpf_real_t *lambda_tmp; /* [n] Double buffer for resampling */
+        rbpf_real_t *log_lambda; /* [n] log(λ) for shifted observation */
+
+        /* Per-regime Student-t configuration */
+        RBPF_StudentT_Config student_t[RBPF_MAX_REGIMES];
+
+        /* Per-regime ν learning statistics */
+        RBPF_StudentT_Stats student_t_stats[RBPF_MAX_REGIMES];
+
+        /* Global Student-t enable flag */
+        int student_t_enabled;
 
         /*========================================================================
          * RNG
@@ -572,6 +717,16 @@ typedef float rbpf_real_t;
 
         /* Robust OCSN diagnostics */
         rbpf_real_t outlier_fraction; /* Weighted avg P(outlier | obs), [0,1] */
+
+        /*========================================================================
+         * STUDENT-T DIAGNOSTICS
+         *======================================================================*/
+        rbpf_real_t lambda_mean;                  /* E[λ] across particles */
+        rbpf_real_t lambda_var;                   /* Var[λ] across particles */
+        rbpf_real_t nu_effective;                 /* Implied ν from λ variance: ν = 2/Var[λ] */
+        rbpf_real_t learned_nu[RBPF_MAX_REGIMES]; /* Current ν estimate per regime */
+        int student_t_active;                     /* 1 if Student-t update was used */
+
     } RBPF_KSC_Output;
 
     /*─────────────────────────────────────────────────────────────────────────────
@@ -631,6 +786,126 @@ typedef float rbpf_real_t;
                                   const rbpf_real_t *pmmh_mu_vol,    /* [n_regimes] */
                                   const rbpf_real_t *pmmh_sigma_vol, /* [n_regimes] */
                                   rbpf_real_t blend);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * STUDENT-T API
+     *
+     * Student-t observation model for fat-tail robustness.
+     *
+     * Two usage modes:
+     *   1. FIXED ν (structural): Set once, different ν per hypothesis in MMPF
+     *   2. LEARNED ν (adaptive): Storvik-style learning from λ statistics
+     *
+     * Recommended: Fixed ν for MMPF (ν IS the hypothesis identity)
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /**
+     * Enable Student-t observation model globally
+     *
+     * @param rbpf     RBPF instance
+     * @param nu       Default degrees of freedom (applied to all regimes)
+     */
+    void rbpf_ksc_enable_student_t(RBPF_KSC *rbpf, rbpf_real_t nu);
+
+    /**
+     * Disable Student-t, revert to Gaussian observations
+     */
+    void rbpf_ksc_disable_student_t(RBPF_KSC *rbpf);
+
+    /**
+     * Set regime-specific ν (for MMPF per-hypothesis configuration)
+     *
+     * @param rbpf     RBPF instance
+     * @param regime   Regime index
+     * @param nu       Degrees of freedom for this regime
+     */
+    void rbpf_ksc_set_student_t_nu(RBPF_KSC *rbpf, int regime, rbpf_real_t nu);
+
+    /**
+     * Enable ν learning for a regime
+     *
+     * Uses accumulated λ statistics to estimate ν online.
+     * Typically NOT recommended for MMPF where ν should be structural.
+     *
+     * @param rbpf           RBPF instance
+     * @param regime         Regime index
+     * @param learning_rate  EWMA decay for λ statistics (0.99 = slow, 0.95 = fast)
+     */
+    void rbpf_ksc_enable_nu_learning(RBPF_KSC *rbpf, int regime, rbpf_real_t learning_rate);
+
+    /**
+     * Disable ν learning, fix to current estimate
+     */
+    void rbpf_ksc_disable_nu_learning(RBPF_KSC *rbpf, int regime);
+
+    /**
+     * Get current ν estimate for regime
+     */
+    rbpf_real_t rbpf_ksc_get_nu(const RBPF_KSC *rbpf, int regime);
+
+    /**
+     * Get λ statistics for regime (for diagnostics/Storvik integration)
+     */
+    void rbpf_ksc_get_lambda_stats(const RBPF_KSC *rbpf, int regime,
+                                   rbpf_real_t *mean_out, rbpf_real_t *var_out,
+                                   rbpf_real_t *n_eff_out);
+
+    /**
+     * Reset ν learning statistics
+     */
+    void rbpf_ksc_reset_nu_learning(RBPF_KSC *rbpf, int regime);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * STUDENT-T UPDATE FUNCTIONS
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /**
+     * Student-t Kalman update via auxiliary variable λ
+     *
+     * Algorithm:
+     *   1. For each particle, sample λ from conditional posterior
+     *   2. Shift observation: y_shifted = y + log(λ)
+     *   3. Run standard 10-component KSC update with y_shifted
+     *   4. Accumulate λ statistics for ν learning (if enabled)
+     *
+     * @param rbpf   RBPF instance (must have Student-t enabled)
+     * @param y      Transformed observation: y = log(r²)
+     * @return       Marginal likelihood p(y_t | y_{1:t-1})
+     */
+    rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y);
+
+    /**
+     * Student-t update with explicit ν (ignores per-regime settings)
+     *
+     * Useful for MMPF where each hypothesis has its own RBPF and ν.
+     *
+     * @param rbpf   RBPF instance
+     * @param y      Transformed observation: y = log(r²)
+     * @param nu     Degrees of freedom to use
+     * @return       Marginal likelihood
+     */
+    rbpf_real_t rbpf_ksc_update_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t y, rbpf_real_t nu);
+
+    /**
+     * Combined step with Student-t observations
+     *
+     * Equivalent to rbpf_ksc_step() but uses Student-t update internally.
+     *
+     * @param rbpf    RBPF instance
+     * @param obs     Raw observation (return r_t, NOT log(r²))
+     * @param output  Output structure
+     */
+    void rbpf_ksc_step_student_t(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output);
+
+    /**
+     * Combined step with explicit ν
+     */
+    void rbpf_ksc_step_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t obs, rbpf_real_t nu,
+                                    RBPF_KSC_Output *output);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * STANDARD API (continued)
+     *───────────────────────────────────────────────────────────────────────────*/
 
     /* Initialize */
     void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0);
@@ -819,6 +1094,14 @@ typedef float rbpf_real_t;
         int enable_learning;
         rbpf_real_t learning_shrinkage;
         int learning_warmup;
+
+        /*========================================================================
+         * STUDENT-T PIPELINE CONFIGURATION
+         *======================================================================*/
+        int enable_student_t;                       /* Use Student-t observations */
+        rbpf_real_t student_t_nu[RBPF_MAX_REGIMES]; /* Per-regime ν */
+        int student_t_learn_nu;                     /* Learn ν online */
+
     } RBPF_PipelineConfig;
 
     /* Opaque pipeline handle */
@@ -851,6 +1134,10 @@ typedef float rbpf_real_t;
                                    rbpf_real_t scale_minor, rbpf_real_t scale_major,
                                    rbpf_real_t scale_low_conf, rbpf_real_t conf_threshold);
     void rbpf_pipeline_set_confirmation(RBPF_Pipeline *pipe, int confirm_minor, int confirm_major);
+
+    /* Student-t runtime control */
+    void rbpf_pipeline_set_student_t(RBPF_Pipeline *pipe, int enable, rbpf_real_t default_nu);
+    void rbpf_pipeline_set_student_t_regime(RBPF_Pipeline *pipe, int regime, rbpf_real_t nu);
 
     /* Debug */
     void rbpf_pipeline_print_config(const RBPF_Pipeline *pipe);

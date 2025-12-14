@@ -3,6 +3,11 @@
  * @brief IMM-MMPF-ROCKS Implementation
  *
  * See mmpf_rocks.h for architecture documentation.
+ *
+ * Student-t Integration:
+ *   Each hypothesis has its own tail thickness (ν). During extreme events,
+ *   Crisis (ν=3) naturally wins Bayesian model comparison because it
+ *   PREDICTED fat tails. No hacks needed — the likelihood does the work.
  */
 
 #ifdef MMPF_USE_TEST_STUB
@@ -426,6 +431,10 @@ MMPF_Config mmpf_config_defaults(void)
      * φ, σ_η: Controlled by WTA Gated Learning
      *         Each hypothesis learns its own dynamics from its own data
      *         This gives "Structural Memory" - Crisis remembers how to be Crisis
+     *
+     * ν (Student-t): Per-hypothesis tail thickness
+     *                Crisis expects fat tails (ν=3), Calm expects thin (ν=10)
+     *                This is the principled Bayesian way to handle fat tails
      *═══════════════════════════════════════════════════════════════════════*/
 
     /* ENABLE Global Baseline - controls μ_vol level for all hypotheses */
@@ -454,20 +463,37 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.baseline_gate_on = RBPF_REAL(0.50);  /* Freeze when w_crisis > 50% */
     cfg.baseline_gate_off = RBPF_REAL(0.40); /* Unfreeze when w_crisis < 40% */
 
-    /* Panic Drift: allow Crisis ceiling to float up during extreme events
-     * Detects fat tails DIRECTLY: if log(y²) exceeds log(σ²) by gap_threshold,
-     * drift accumulates. When observations normalize, drift decays back to zero.
+    /*═══════════════════════════════════════════════════════════════════════
+     * STUDENT-T OBSERVATION MODEL (replaces Panic Drift)
      *
-     * gap = log(y²) - 2×log(σ) = log(y²/σ²) = log((y/σ)²)
-     * threshold=1.5 means y/σ > exp(0.75) ≈ 2.1 (return ~2.1× larger than vol)
-     * For 0.7% vol, triggers at ~1.5% return.
+     * The principled Bayesian solution to fat tails. Each hypothesis has
+     * its own ν (degrees of freedom) that defines expected tail thickness.
      *
-     * AGGRESSIVE TUNING: Lower threshold, faster rate, slower decay */
-    cfg.enable_panic_drift = 1;
-    cfg.panic_drift_threshold = RBPF_REAL(1.5); /* Lower: trigger on ~2.1× exceedance */
-    cfg.panic_drift_rate = RBPF_REAL(0.25);     /* Faster accumulation */
-    cfg.panic_drift_decay = RBPF_REAL(0.95);    /* Slower decay (~14 tick half-life) */
-    cfg.panic_drift_max = RBPF_REAL(2.5);       /* Higher ceiling: +2.0 to +4.5 */
+     * During a 5% daily move (≈6σ under Gaussian):
+     *   Calm (ν=10):   P(|ε|>5σ) ≈ 10⁻⁵  → "This is impossible!"
+     *   Crisis (ν=3):  P(|ε|>5σ) ≈ 10⁻²  → "This is expected"
+     *
+     * Crisis naturally wins Bayesian model comparison because it PREDICTED
+     * fat tails. No hacks needed — the likelihood does the work.
+     *
+     * This replaces Panic Drift with a principled approach.
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    cfg.enable_student_t = 1; /* ENABLED by default (recommended) */
+
+    /* Per-hypothesis ν (degrees of freedom)
+     * Lower ν = fatter tails = higher probability of extreme observations */
+    cfg.hypothesis_nu[MMPF_CALM] = RBPF_REAL(10.0);  /* Near-Gaussian tails */
+    cfg.hypothesis_nu[MMPF_TREND] = RBPF_REAL(5.0);  /* Moderate fat tails */
+    cfg.hypothesis_nu[MMPF_CRISIS] = RBPF_REAL(3.0); /* Heavy fat tails */
+
+    /* Optional: WTA-gated ν learning (disabled by default)
+     * Only dominant hypothesis learns its ν from data.
+     * This gives "tail thickness memory" — Crisis remembers how fat-tailed it is. */
+    cfg.enable_nu_learning = 0;             /* Disabled: ν is structural by default */
+    cfg.nu_floor = RBPF_REAL(2.5);          /* Minimum ν (prevent instability) */
+    cfg.nu_ceil = RBPF_REAL(30.0);          /* Maximum ν (near-Gaussian) */
+    cfg.nu_learning_rate = RBPF_REAL(0.99); /* EWMA rate for ν learning */
 
     /* ENABLE WTA Gated Learning - learns DYNAMICS only (φ, σ_η), NOT μ_vol
      * μ_vol is controlled by baseline + offsets (preserves identity)
@@ -479,14 +505,17 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.hypotheses[MMPF_CALM].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CALM];
     cfg.hypotheses[MMPF_CALM].phi = RBPF_REAL(0.98);
     cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.10);
+    cfg.hypotheses[MMPF_CALM].nu = cfg.hypothesis_nu[MMPF_CALM];
 
     cfg.hypotheses[MMPF_TREND].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_TREND];
     cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);
     cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.20);
+    cfg.hypotheses[MMPF_TREND].nu = cfg.hypothesis_nu[MMPF_TREND];
 
     cfg.hypotheses[MMPF_CRISIS].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CRISIS];
     cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.80);
     cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50);
+    cfg.hypotheses[MMPF_CRISIS].nu = cfg.hypothesis_nu[MMPF_CRISIS];
 
     /* IMM settings */
     cfg.base_stickiness = RBPF_REAL(0.98);
@@ -840,6 +869,33 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
              * our regime params (set from global baseline + offsets) */
             mmpf->ext[k]->rbpf->use_learned_params = 0;
         }
+
+        /*═══════════════════════════════════════════════════════════════════
+         * STUDENT-T CONFIGURATION (per-hypothesis)
+         *═══════════════════════════════════════════════════════════════════*/
+        if (cfg.enable_student_t)
+        {
+            /* Enable Student-t on this RBPF with hypothesis-specific ν */
+            rbpf_ksc_enable_student_t(mmpf->ext[k]->rbpf, hp->nu);
+
+            /* Configure per-regime ν (all KSC regimes get same ν for this hypothesis) */
+            for (int r = 0; r < cfg.n_ksc_regimes; r++)
+            {
+                rbpf_ksc_set_student_t_nu(mmpf->ext[k]->rbpf, r, hp->nu);
+            }
+
+            /* Enable ν learning if configured */
+            if (cfg.enable_nu_learning)
+            {
+                for (int r = 0; r < cfg.n_ksc_regimes; r++)
+                {
+                    rbpf_ksc_enable_nu_learning(mmpf->ext[k]->rbpf, r, cfg.nu_learning_rate);
+                }
+            }
+        }
+
+        /* Initialize learned_nu state */
+        mmpf->learned_nu[k] = hp->nu;
     }
 
     /* Create particle buffers for IMM mixing */
@@ -915,8 +971,7 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
 
     mmpf->global_mu_vol = cfg.global_mu_vol_init;
     mmpf->prev_weighted_log_vol = cfg.global_mu_vol_init;
-    mmpf->baseline_frozen_ticks = 0;     /* Not frozen at start */
-    mmpf->crisis_drift = RBPF_REAL(0.0); /* No panic drift at start */
+    mmpf->baseline_frozen_ticks = 0; /* Not frozen at start */
 
     /* Initialize gated dynamics learners with per-hypothesis μ_vol */
     for (int k = 0; k < MMPF_N_MODELS; k++)
@@ -984,6 +1039,18 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
              * our regime params (set from global baseline + offsets) */
             mmpf->ext[k]->rbpf->use_learned_params = 0;
         }
+
+        /* Reset Student-t ν learning if enabled */
+        if (mmpf->config.enable_student_t && mmpf->config.enable_nu_learning)
+        {
+            for (int r = 0; r < mmpf->ext[k]->rbpf->n_regimes; r++)
+            {
+                rbpf_ksc_reset_nu_learning(mmpf->ext[k]->rbpf, r);
+            }
+        }
+
+        /* Reset learned_nu to initial values */
+        mmpf->learned_nu[k] = mmpf->config.hypothesis_nu[k];
     }
 
     /* Reset weights */
@@ -1026,8 +1093,7 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 
     mmpf->global_mu_vol = log_vol;
     mmpf->prev_weighted_log_vol = log_vol;
-    mmpf->baseline_frozen_ticks = 0;     /* Not frozen after reset */
-    mmpf->crisis_drift = RBPF_REAL(0.0); /* No panic drift after reset */
+    mmpf->baseline_frozen_ticks = 0; /* Not frozen after reset */
 
     /* Reanchor hypotheses around new baseline */
     if (mmpf->config.enable_global_baseline)
@@ -1200,84 +1266,14 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
     }
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * PANIC DRIFT: Adaptive Crisis Ceiling for Fat Tails
-     *
-     * Detects fat tails DIRECTLY from observation vs estimate gap.
-     * If observation massively exceeds our current weighted estimate,
-     * this IS a fat tail regardless of which hypothesis is winning.
-     *
-     * Example: Current estimate = 1% vol (log = -4.6)
-     *          Observation y_log = -2.3 → implies 10% vol
-     *          Gap = -2.3 - (-4.6) = +2.3 (huge!)
-     *          This triggers drift even if Crisis probability is low.
-     *
-     * The drift helps Crisis become more competitive for extreme observations.
-     * When observations return to normal, drift decays back to zero.
-     *═══════════════════════════════════════════════════════════════════════*/
-
-    if (mmpf->config.enable_panic_drift && !skip_update)
-    {
-        /* Compare log(y²) to expected log(σ²) = 2×log(σ)
-         * If observation much larger than expected, this is a fat tail.
-         *
-         * Example: estimate log(σ) = -4.97 (0.7% vol)
-         *          expected log(y²) = 2×(-4.97) = -9.94
-         *          observe 3% return: log(0.03²) = -7.0
-         *          gap = -7.0 - (-9.94) = +2.94 ← FAT TAIL DETECTED
-         */
-        rbpf_real_t expected_log_y2 = RBPF_REAL(2.0) * mmpf->prev_weighted_log_vol;
-        rbpf_real_t gap = y_log - expected_log_y2;
-
-        /* Trigger if observation exceeds expected by threshold */
-        if (gap > mmpf->config.panic_drift_threshold)
-        {
-            /* Fat tail detected! Observation much louder than estimate.
-             * Drift the Crisis ceiling up toward the observation */
-            mmpf->crisis_drift += mmpf->config.panic_drift_rate * gap;
-        }
-        else
-        {
-            /* Normal observation - decay drift back to zero */
-            mmpf->crisis_drift *= mmpf->config.panic_drift_decay;
-        }
-
-        /* Cap the drift for safety */
-        if (mmpf->crisis_drift > mmpf->config.panic_drift_max)
-        {
-            mmpf->crisis_drift = mmpf->config.panic_drift_max;
-        }
-        if (mmpf->crisis_drift < RBPF_REAL(0.0))
-        {
-            mmpf->crisis_drift = RBPF_REAL(0.0);
-        }
-
-        /* Apply drift to Crisis anchor (reanchor Crisis RBPF) */
-        if (mmpf->crisis_drift > RBPF_REAL(0.01))
-        { /* Only if meaningful drift */
-            rbpf_real_t crisis_anchor = mmpf->global_mu_vol + mmpf->config.mu_vol_offsets[MMPF_CRISIS];
-            rbpf_real_t new_crisis_mu = crisis_anchor + mmpf->crisis_drift;
-
-            /* Push to Crisis RBPF */
-            RBPF_Extended *ext = mmpf->ext[MMPF_CRISIS];
-            for (int r = 0; r < ext->rbpf->n_regimes; r++)
-            {
-                ext->rbpf->params[r].mu_vol = new_crisis_mu;
-            }
-
-            /* Also update gated learner's anchor */
-            mmpf->gated_dynamics[MMPF_CRISIS].mu_vol = (double)new_crisis_mu;
-        }
-    }
-
     /* 7. Step each RBPF with PER-HYPOTHESIS OCSN and cache outputs
      *
      * CRITICAL: Each hypothesis has its OWN OCSN configuration.
      * A 5% move is a 6σ outlier for Calm but only 1.4σ for Crisis.
      * Using per-hypothesis OCSN prevents cross-contamination of outlier signals.
      *
-     * We call the individual RBPF functions directly instead of rbpf_ksc_step()
-     * to use the robust OCSN update path with hypothesis-specific parameters.
+     * STUDENT-T: If enabled, each hypothesis uses its own ν.
+     * Crisis (ν=3) assigns higher likelihood to fat-tailed observations.
      */
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
@@ -1310,13 +1306,24 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
         else
         {
-            /* 7c. Robust OCSN update with PER-HYPOTHESIS outlier params */
-            if (ocsn->enabled)
+            /* 7c. Update step - Student-t or Gaussian
+             *
+             * Student-t: Crisis (ν=3) assigns higher likelihood to fat tails
+             * This is the principled Bayesian solution - no hacks needed.
+             */
+            if (mmpf->config.enable_student_t && rbpf->student_t_enabled)
             {
+                /* Student-t update with per-hypothesis ν */
+                marginal_lik = rbpf_ksc_update_student_t(rbpf, y_log);
+            }
+            else if (ocsn->enabled)
+            {
+                /* Robust OCSN update (Gaussian with outlier component) */
                 marginal_lik = rbpf_ksc_update_robust(rbpf, y_log, ocsn);
             }
             else
             {
+                /* Standard Gaussian update */
                 marginal_lik = rbpf_ksc_update(rbpf, y_log);
             }
         }
@@ -1586,6 +1593,29 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
     }
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 12: WTA-GATED ν LEARNING (Optional - structural tail thickness)
+     *
+     * Only dominant hypothesis updates its ν from data.
+     * This gives "tail thickness memory" — Crisis remembers how fat-tailed it is.
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    if (mmpf->config.enable_student_t && mmpf->config.enable_nu_learning && !skip_update)
+    {
+        /* Only dominant hypothesis learns ν */
+        int dominant = (int)mmpf->dominant;
+
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            if (k == dominant)
+            {
+                /* Get current ν from RBPF (may have been updated by Storvik) */
+                mmpf->learned_nu[k] = rbpf_ksc_get_nu(mmpf->ext[k]->rbpf, 0);
+            }
+            /* Non-dominant hypotheses keep their current ν (structural memory) */
+        }
+    }
+
     /* Fill output structure if provided */
     if (output)
     {
@@ -1626,6 +1656,15 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         /* Global baseline diagnostics */
         output->global_mu_vol = mmpf->global_mu_vol;
         output->baseline_frozen = (mmpf->baseline_frozen_ticks > 0) ? 1 : 0;
+
+        /* Student-t diagnostics */
+        output->student_t_active = mmpf->config.enable_student_t ? 1 : 0;
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            output->model_nu[k] = mmpf->learned_nu[k];
+            output->model_lambda_mean[k] = mmpf->model_output[k].lambda_mean;
+            output->model_nu_effective[k] = mmpf->model_output[k].nu_effective;
+        }
     }
 }
 
@@ -1720,6 +1759,11 @@ int mmpf_get_baseline_frozen_ticks(const MMPF_ROCKS *mmpf)
     return mmpf->baseline_frozen_ticks;
 }
 
+rbpf_real_t mmpf_get_model_nu(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model)
+{
+    return mmpf->learned_nu[model];
+}
+
 /*═══════════════════════════════════════════════════════════════════════════
  * IMM CONTROL
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -1757,6 +1801,89 @@ void mmpf_set_weights(MMPF_ROCKS *mmpf, const rbpf_real_t *weights)
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
         mmpf->log_weights[k] = rbpf_log(mmpf->weights[k]);
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * STUDENT-T CONTROL
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void mmpf_enable_student_t(MMPF_ROCKS *mmpf, const rbpf_real_t *nu)
+{
+    if (!mmpf)
+        return;
+
+    mmpf->config.enable_student_t = 1;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        rbpf_real_t nu_k = nu ? nu[k] : mmpf->config.hypothesis_nu[k];
+
+        /* Enable Student-t on underlying RBPF */
+        rbpf_ksc_enable_student_t(mmpf->ext[k]->rbpf, nu_k);
+
+        /* Set per-regime ν (all KSC regimes get same ν) */
+        for (int r = 0; r < mmpf->ext[k]->rbpf->n_regimes; r++)
+        {
+            rbpf_ksc_set_student_t_nu(mmpf->ext[k]->rbpf, r, nu_k);
+        }
+
+        mmpf->learned_nu[k] = nu_k;
+    }
+}
+
+void mmpf_disable_student_t(MMPF_ROCKS *mmpf)
+{
+    if (!mmpf)
+        return;
+
+    mmpf->config.enable_student_t = 0;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        rbpf_ksc_disable_student_t(mmpf->ext[k]->rbpf);
+    }
+}
+
+void mmpf_set_hypothesis_nu(MMPF_ROCKS *mmpf, MMPF_Hypothesis model, rbpf_real_t nu)
+{
+    if (!mmpf || model < 0 || model >= MMPF_N_MODELS)
+        return;
+
+    mmpf->config.hypothesis_nu[model] = nu;
+    mmpf->learned_nu[model] = nu;
+
+    /* Push to underlying RBPF */
+    for (int r = 0; r < mmpf->ext[model]->rbpf->n_regimes; r++)
+    {
+        rbpf_ksc_set_student_t_nu(mmpf->ext[model]->rbpf, r, nu);
+    }
+}
+
+void mmpf_set_nu_learning(MMPF_ROCKS *mmpf, int enable, rbpf_real_t learning_rate)
+{
+    if (!mmpf)
+        return;
+
+    mmpf->config.enable_nu_learning = enable;
+    mmpf->config.nu_learning_rate = learning_rate;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        if (enable)
+        {
+            for (int r = 0; r < mmpf->ext[k]->rbpf->n_regimes; r++)
+            {
+                rbpf_ksc_enable_nu_learning(mmpf->ext[k]->rbpf, r, learning_rate);
+            }
+        }
+        else
+        {
+            for (int r = 0; r < mmpf->ext[k]->rbpf->n_regimes; r++)
+            {
+                rbpf_ksc_disable_nu_learning(mmpf->ext[k]->rbpf, r);
+            }
+        }
     }
 }
 
@@ -1888,9 +2015,9 @@ void mmpf_print_summary(const MMPF_ROCKS *mmpf)
     printf("IMM mix count:       %lu\n", (unsigned long)mmpf->imm_mix_count);
     printf("\n");
     printf("Model Weights:\n");
-    printf("  Calm:   %.4f\n", (double)mmpf->weights[MMPF_CALM]);
-    printf("  Trend:  %.4f\n", (double)mmpf->weights[MMPF_TREND]);
-    printf("  Crisis: %.4f\n", (double)mmpf->weights[MMPF_CRISIS]);
+    printf("  Calm:   %.4f (ν=%.1f)\n", (double)mmpf->weights[MMPF_CALM], (double)mmpf->learned_nu[MMPF_CALM]);
+    printf("  Trend:  %.4f (ν=%.1f)\n", (double)mmpf->weights[MMPF_TREND], (double)mmpf->learned_nu[MMPF_TREND]);
+    printf("  Crisis: %.4f (ν=%.1f)\n", (double)mmpf->weights[MMPF_CRISIS], (double)mmpf->learned_nu[MMPF_CRISIS]);
     printf("\n");
     printf("Dominant: %s (prob=%.4f)\n",
            mmpf->dominant == MMPF_CALM ? "Calm" : mmpf->dominant == MMPF_TREND ? "Trend"
@@ -1901,6 +2028,9 @@ void mmpf_print_summary(const MMPF_ROCKS *mmpf)
     printf("Weighted volatility: %.6f\n", (double)mmpf->weighted_vol);
     printf("Outlier fraction:    %.4f\n", (double)mmpf->outlier_fraction);
     printf("Current stickiness:  %.4f\n", (double)mmpf->current_stickiness);
+    printf("\n");
+    printf("Student-t:           %s\n", mmpf->config.enable_student_t ? "ENABLED" : "disabled");
+    printf("ν learning:          %s\n", mmpf->config.enable_nu_learning ? "ENABLED" : "disabled");
     printf("═══════════════════════════════════════════════════════════════════\n");
 }
 
@@ -1918,6 +2048,11 @@ void mmpf_print_output(const MMPF_Output *output)
     printf("  Stickiness:      %.4f\n", (double)output->current_stickiness);
     printf("  Regime stable:   %d (ticks=%d)\n",
            output->regime_stable, output->ticks_in_regime);
+    if (output->student_t_active)
+    {
+        printf("  Student-t ν:     [%.1f, %.1f, %.1f]\n",
+               (double)output->model_nu[0], (double)output->model_nu[1], (double)output->model_nu[2]);
+    }
 }
 
 void mmpf_get_diagnostics(const MMPF_ROCKS *mmpf,
