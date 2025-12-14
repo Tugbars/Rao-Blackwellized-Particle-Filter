@@ -231,10 +231,11 @@ extern "C"
          * PANIC DRIFT (Adaptive Crisis Ceiling)
          *
          * During extreme events, the fixed Crisis offset may be too low to capture
-         * fat tails. Detects fat tails DIRECTLY by comparing observation to estimate.
+         * fat tails. Detects fat tails DIRECTLY by comparing observation to expected.
          *
-         * If observation exceeds current weighted estimate by more than gap_threshold
-         * (in log-space), drift accumulates. When observations normalize, drift decays.
+         * gap = log(y²) - 2×log(σ) = log((return/vol)²)
+         * If gap > threshold, observation is much larger than expected → fat tail.
+         * threshold=2.0 means return ~2.7× larger than volatility.
          *
          * This captures fat tails without needing Crisis to already be dominant -
          * solving the chicken-and-egg problem where extreme observations spread
@@ -242,9 +243,9 @@ extern "C"
          *═══════════════════════════════════════════════════════════════════════*/
 
         int enable_panic_drift;            /* 1 = allow Crisis ceiling to float up */
-        rbpf_real_t panic_drift_threshold; /* Gap threshold in log-space (default: 1.0) */
-        rbpf_real_t panic_drift_rate;      /* How fast drift accumulates (default: 0.3) */
-        rbpf_real_t panic_drift_decay;     /* How fast drift decays (default: 0.90) */
+        rbpf_real_t panic_drift_threshold; /* Gap threshold: log(y²) - log(σ²) */
+        rbpf_real_t panic_drift_rate;      /* How fast drift accumulates (default: 0.15) */
+        rbpf_real_t panic_drift_decay;     /* How fast drift decays (default: 0.92) */
         rbpf_real_t panic_drift_max;       /* Maximum drift allowed (default: 2.0) */
 
         /*═══════════════════════════════════════════════════════════════════════

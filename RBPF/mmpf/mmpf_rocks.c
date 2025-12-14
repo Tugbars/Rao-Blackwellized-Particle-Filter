@@ -455,14 +455,19 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.baseline_gate_off = RBPF_REAL(0.40); /* Unfreeze when w_crisis < 40% */
 
     /* Panic Drift: allow Crisis ceiling to float up during extreme events
-     * Detects fat tails DIRECTLY: if observation exceeds estimate by gap_threshold,
+     * Detects fat tails DIRECTLY: if log(y²) exceeds log(σ²) by gap_threshold,
      * drift accumulates. When observations normalize, drift decays back to zero.
-     * This captures fat tails without needing Crisis to already be dominant. */
+     *
+     * gap = log(y²) - 2×log(σ) = log(y²/σ²) = log((y/σ)²)
+     * threshold=1.5 means y/σ > exp(0.75) ≈ 2.1 (return ~2.1× larger than vol)
+     * For 0.7% vol, triggers at ~1.5% return.
+     *
+     * AGGRESSIVE TUNING: Lower threshold, faster rate, slower decay */
     cfg.enable_panic_drift = 1;
-    cfg.panic_drift_threshold = RBPF_REAL(1.0); /* Gap in log-space (~2.7× in vol) */
-    cfg.panic_drift_rate = RBPF_REAL(0.30);     /* Accumulation rate (faster) */
-    cfg.panic_drift_decay = RBPF_REAL(0.90);    /* Decay factor (faster reversion) */
-    cfg.panic_drift_max = RBPF_REAL(2.0);       /* Max drift: Crisis can go from +2.0 to +4.0 */
+    cfg.panic_drift_threshold = RBPF_REAL(1.5); /* Lower: trigger on ~2.1× exceedance */
+    cfg.panic_drift_rate = RBPF_REAL(0.25);     /* Faster accumulation */
+    cfg.panic_drift_decay = RBPF_REAL(0.95);    /* Slower decay (~14 tick half-life) */
+    cfg.panic_drift_max = RBPF_REAL(2.5);       /* Higher ceiling: +2.0 to +4.5 */
 
     /* ENABLE WTA Gated Learning - learns DYNAMICS only (φ, σ_η), NOT μ_vol
      * μ_vol is controlled by baseline + offsets (preserves identity)
@@ -1213,11 +1218,18 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
     if (mmpf->config.enable_panic_drift && !skip_update)
     {
-        /* Use PREVIOUS weighted estimate (from last tick) as reference */
-        rbpf_real_t current_estimate = mmpf->prev_weighted_log_vol;
-        rbpf_real_t gap = y_log - current_estimate;
+        /* Compare log(y²) to expected log(σ²) = 2×log(σ)
+         * If observation much larger than expected, this is a fat tail.
+         *
+         * Example: estimate log(σ) = -4.97 (0.7% vol)
+         *          expected log(y²) = 2×(-4.97) = -9.94
+         *          observe 3% return: log(0.03²) = -7.0
+         *          gap = -7.0 - (-9.94) = +2.94 ← FAT TAIL DETECTED
+         */
+        rbpf_real_t expected_log_y2 = RBPF_REAL(2.0) * mmpf->prev_weighted_log_vol;
+        rbpf_real_t gap = y_log - expected_log_y2;
 
-        /* Trigger if observation exceeds estimate by threshold */
+        /* Trigger if observation exceeds expected by threshold */
         if (gap > mmpf->config.panic_drift_threshold)
         {
             /* Fat tail detected! Observation much louder than estimate.
