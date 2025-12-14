@@ -9,14 +9,22 @@
  * Three parallel RBPF_Extended instances with different structural hypotheses
  * about volatility dynamics:
  *
- *   Calm:   φ=0.98, σ=0.10  (tight mean-reversion)
- *   Trend:  φ=0.95, σ=0.20  (momentum, moderate noise)
- *   Crisis: φ=0.80, σ=0.50  (explosive, low persistence)
+ *   Calm:   φ=0.98, σ=0.10, ν=10 (near-Gaussian tails)
+ *   Trend:  φ=0.95, σ=0.20, ν=5  (moderate fat tails)
+ *   Crisis: φ=0.80, σ=0.50, ν=3  (heavy fat tails)
  *
  * Each RBPF_Extended bundles:
  *   - RBPF_KSC: Rao-Blackwellized particle filter with KSC mixture
  *   - Storvik: Online parameter learning
  *   - OCSN: Outlier Component Selection Network (per-hypothesis!)
+ *
+ * STUDENT-T OBSERVATION MODEL (NEW):
+ * Each hypothesis has its own tail thickness (ν). During a 5% daily move:
+ *   - Calm (ν=10):   P(|ε|>5σ) ≈ 10⁻⁵  → "This is impossible!"
+ *   - Crisis (ν=3):  P(|ε|>5σ) ≈ 10⁻²  → "This is expected"
+ *
+ * Crisis naturally wins Bayesian model comparison because it PREDICTED fat tails.
+ * No hacks needed — the likelihood does the work.
  *
  * WHY PER-HYPOTHESIS OCSN:
  * Same observation, different interpretations. A 5% move is 6σ under Calm
@@ -43,9 +51,11 @@
  *   4. Stratified resample: draw from combined pool into each model
  *   5. Import mixed particles back into models
  *   6. Step each RBPF_Extended (predict → update), get marginal likelihood
+ *      - If Student-t enabled: use per-hypothesis ν in update
  *   7. Bayesian model weight update: w[k] *= L[k]
  *   8. Compute weighted volatility output
  *   9. Get per-model OCSN outlier fraction for next tick
+ *  10. (Optional) WTA-gated ν learning: dominant hypothesis updates its ν
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * REFERENCES
@@ -54,6 +64,7 @@
  * - Blom & Bar-Shalom (1988): IMM algorithm
  * - Kim, Shephard & Chib (1998): KSC mixture for SV
  * - Storvik (2002): Online parameter learning via sufficient statistics
+ * - Geweke (1993): Bayesian treatment of SV with t-errors
  *
  */
 
@@ -85,9 +96,9 @@ extern "C"
 
     typedef enum
     {
-        MMPF_CALM = 0,  /* Tight mean-reversion, low vol-of-vol */
+        MMPF_CALM = 0,  /* Tight mean-reversion, low vol-of-vol, thin tails */
         MMPF_TREND = 1, /* Moderate persistence, medium vol-of-vol */
-        MMPF_CRISIS = 2 /* Low persistence, high vol-of-vol */
+        MMPF_CRISIS = 2 /* Low persistence, high vol-of-vol, fat tails */
     } MMPF_Hypothesis;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -97,6 +108,7 @@ extern "C"
      *   ℓ_t = μ + φ(ℓ_{t-1} - μ) + σ·η_t
      *
      * Only μ (mean level) is learned via Storvik. φ and σ are fixed per hypothesis.
+     * ν (tail thickness) defines whether the hypothesis expects fat tails.
      *═══════════════════════════════════════════════════════════════════════════*/
 
     typedef struct
@@ -104,6 +116,7 @@ extern "C"
         rbpf_real_t mu_vol;    /* Long-run mean log-volatility */
         rbpf_real_t phi;       /* Persistence (mean-reversion speed = 1-φ) */
         rbpf_real_t sigma_eta; /* Vol-of-vol (innovation std dev) */
+        rbpf_real_t nu;        /* Student-t degrees of freedom (tail thickness) */
     } MMPF_HypothesisParams;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -228,25 +241,32 @@ extern "C"
         rbpf_real_t baseline_gate_off; /* Unfreeze when w_crisis < this (default: 0.4) */
 
         /*═══════════════════════════════════════════════════════════════════════
-         * PANIC DRIFT (Adaptive Crisis Ceiling)
+         * STUDENT-T OBSERVATION MODEL
          *
-         * During extreme events, the fixed Crisis offset may be too low to capture
-         * fat tails. Detects fat tails DIRECTLY by comparing observation to expected.
+         * Each hypothesis has its own tail thickness (ν). This is the principled
+         * Bayesian way to handle fat tails:
          *
-         * gap = log(y²) - 2×log(σ) = log((return/vol)²)
-         * If gap > threshold, observation is much larger than expected → fat tail.
-         * threshold=2.0 means return ~2.7× larger than volatility.
+         *   Calm:   ν=10 → P(5σ) ≈ 10⁻⁵  (near-Gaussian, fat tails are "impossible")
+         *   Trend:  ν=5  → P(5σ) ≈ 10⁻³  (moderate tails)
+         *   Crisis: ν=3  → P(5σ) ≈ 10⁻²  (heavy tails, fat tails are "expected")
          *
-         * This captures fat tails without needing Crisis to already be dominant -
-         * solving the chicken-and-egg problem where extreme observations spread
-         * probability across all hypotheses rather than concentrating on Crisis.
+         * During a 5% daily move (≈6σ under Gaussian):
+         *   - Crisis naturally wins because it PREDICTED fat tails
+         *   - No hacks needed — the likelihood does the work
+         *
+         * This replaces the old Panic Drift mechanism with a principled approach.
          *═══════════════════════════════════════════════════════════════════════*/
 
-        int enable_panic_drift;            /* 1 = allow Crisis ceiling to float up */
-        rbpf_real_t panic_drift_threshold; /* Gap threshold: log(y²) - log(σ²) */
-        rbpf_real_t panic_drift_rate;      /* How fast drift accumulates (default: 0.15) */
-        rbpf_real_t panic_drift_decay;     /* How fast drift decays (default: 0.92) */
-        rbpf_real_t panic_drift_max;       /* Maximum drift allowed (default: 2.0) */
+        int enable_student_t;                     /* 1 = use Student-t observations (recommended) */
+        rbpf_real_t hypothesis_nu[MMPF_N_MODELS]; /* Per-hypothesis ν (degrees of freedom) */
+
+        /* Optional: WTA-gated ν learning
+         * Only dominant hypothesis learns its ν from data.
+         * This gives "structural memory" — Crisis remembers how fat-tailed it is. */
+        int enable_nu_learning;       /* 1 = learn ν via Storvik auxiliary stats */
+        rbpf_real_t nu_floor;         /* Minimum ν (default: 2.5) */
+        rbpf_real_t nu_ceil;          /* Maximum ν (default: 30.0) */
+        rbpf_real_t nu_learning_rate; /* EWMA rate for ν learning (default: 0.99) */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GATED DYNAMICS LEARNING
@@ -309,6 +329,12 @@ extern "C"
 
         /* Zero return handling */
         int update_skipped; /* 1 if observation was treated as censored */
+
+        /* Student-t diagnostics */
+        int student_t_active;                          /* 1 if Student-t was used this tick */
+        rbpf_real_t model_lambda_mean[MMPF_N_MODELS];  /* E[λ] per model (1.0 = Gaussian) */
+        rbpf_real_t model_nu_effective[MMPF_N_MODELS]; /* Implied ν from λ variance */
+        rbpf_real_t model_nu[MMPF_N_MODELS];           /* Current ν per model (fixed or learned) */
 
     } MMPF_Output;
 
@@ -447,13 +473,13 @@ extern "C"
         int baseline_frozen_ticks;         /* Ticks since baseline was frozen (0 = not frozen) */
 
         /*═══════════════════════════════════════════════════════════════════════
-         * PANIC DRIFT STATE
+         * STUDENT-T STATE (per-hypothesis)
          *
-         * During extreme events, the fixed Crisis offset may be too low.
-         * Panic Drift allows the Crisis ceiling to float up temporarily.
+         * Each hypothesis has its own ν (degrees of freedom). When learning is
+         * enabled, only the dominant hypothesis updates its ν each tick.
          *═══════════════════════════════════════════════════════════════════════*/
 
-        rbpf_real_t crisis_drift; /* Current drift added to Crisis offset */
+        rbpf_real_t learned_nu[MMPF_N_MODELS]; /* Current ν per hypothesis (fixed or learned) */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GATED LEARNING STATE (per-hypothesis)
@@ -495,11 +521,12 @@ extern "C"
      *
      * Defaults:
      *   - 512 particles per model
-     *   - Calm: φ=0.98, σ=0.10
-     *   - Trend: φ=0.95, σ=0.20
-     *   - Crisis: φ=0.80, σ=0.50
+     *   - Calm: φ=0.98, σ=0.10, ν=10
+     *   - Trend: φ=0.95, σ=0.20, ν=5
+     *   - Crisis: φ=0.80, σ=0.50, ν=3
      *   - Base stickiness: 0.98
      *   - Adaptive stickiness: enabled
+     *   - Student-t: enabled
      */
     MMPF_Config mmpf_config_defaults(void);
 
@@ -551,9 +578,11 @@ extern "C"
      *   4. Stratified resample into each model
      *   5. Import mixed particles
      *   6. Step each RBPF (returns marginal likelihood)
+     *      - If Student-t enabled: use per-hypothesis ν
      *   7. Bayesian weight update
      *   8. Compute weighted output
      *   9. Get OCSN for next tick
+     *  10. (Optional) WTA-gated ν learning
      *
      * @param mmpf    MMPF instance
      * @param y       Observation: log(r²) where r is return
@@ -668,6 +697,12 @@ extern "C"
      */
     int mmpf_get_baseline_frozen_ticks(const MMPF_ROCKS *mmpf);
 
+    /**
+     * Get current ν (degrees of freedom) for a hypothesis.
+     * Returns fixed or learned value depending on configuration.
+     */
+    rbpf_real_t mmpf_get_model_nu(const MMPF_ROCKS *mmpf, MMPF_Hypothesis model);
+
     /*═══════════════════════════════════════════════════════════════════════════
      * API: IMM Control
      *═══════════════════════════════════════════════════════════════════════════*/
@@ -697,6 +732,33 @@ extern "C"
      * @param weights  New weights [MMPF_N_MODELS], will be normalized
      */
     void mmpf_set_weights(MMPF_ROCKS *mmpf, const rbpf_real_t *weights);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API: Student-t Control
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Enable Student-t observations with per-hypothesis ν.
+     *
+     * @param mmpf  MMPF instance
+     * @param nu    Array of ν values [MMPF_N_MODELS], or NULL for defaults
+     */
+    void mmpf_enable_student_t(MMPF_ROCKS *mmpf, const rbpf_real_t *nu);
+
+    /**
+     * Disable Student-t (revert to Gaussian observations).
+     */
+    void mmpf_disable_student_t(MMPF_ROCKS *mmpf);
+
+    /**
+     * Set ν for a specific hypothesis.
+     */
+    void mmpf_set_hypothesis_nu(MMPF_ROCKS *mmpf, MMPF_Hypothesis model, rbpf_real_t nu);
+
+    /**
+     * Enable/disable WTA-gated ν learning.
+     */
+    void mmpf_set_nu_learning(MMPF_ROCKS *mmpf, int enable, rbpf_real_t learning_rate);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API: BOCPD Shock Mechanism
